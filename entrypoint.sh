@@ -52,52 +52,113 @@ mkdir -p "$MODELS_DIR"/{checkpoints,loras,controlnet,upscale_models,faces,vae,cl
 mkdir -p "$COMFY_DIR/user/default/workflows"
 mkdir -p "$COMFY_DIR/custom_nodes"
 
-# ---- HF-Sync: nur vorhandene Ordner kopieren ----
-sync_dir(){
-  local SRC="$1" DST="$2"
-  if [[ -d "$SRC" ]]; then
-    mkdir -p "$DST"
-    # --delete verhindert Ansammlungen; --whole-file vermeidet tmp-Duplikate; --prune-empty-dirs hält sauber
-    rsync -a --delete --prune-empty-dirs "$SRC"/ "$DST"/
-    log "Synced $(basename "$SRC") → $DST"
+# ==== HF Direct Download – ALLES (große Dateien, Progress) ====
+# Lädt ALLE Dateien aus den Unterordnern und kopiert sie in die korrekten ComfyUI-Verzeichnisse.
+# Benötigt ausreichend Speicher (typisch 30–35 GB).
+
+download_all_from_hf() {
+  if [ -z "${HF_REPO_ID:-}" ] || [ -z "${HF_TOKEN:-}" ]; then
+    log "HF Direct Download übersprungen (HF_REPO_ID/HF_TOKEN fehlen)."
+    return
   fi
+
+  python - <<'PY'
+import os, sys, shutil, math, time
+from huggingface_hub import HfApi, hf_hub_download, login
+
+def human(n):
+    units=["B","KB","MB","GB","TB"]; i=0
+    while n>=1024 and i<len(units)-1:
+        n/=1024; i+=1
+    return f"{n:.2f} {units[i]}"
+
+repo   = os.environ.get("HF_REPO_ID","")
+token  = os.environ.get("HF_TOKEN","")
+work   = os.environ.get("WORKSPACE","/workspace")
+comfy  = os.path.join(work,"ComfyUI")
+models = os.path.join(comfy,"models")
+
+login(token=token, add_to_git_credential=False)
+api = HfApi()
+
+# Map: HF-Subfolder -> Zielverzeichnis
+MAP = {
+  "checkpoints":    os.path.join(models,"checkpoints"),
+  "loras":          os.path.join(models,"loras"),
+  "controlnet":     os.path.join(models,"controlnet"),
+  "upscale_models": os.path.join(models,"upscale_models"),
+  "faces":          os.path.join(models,"faces"),
+  "vae":            os.path.join(models,"vae"),
+  # Workflows separat behandelt (nur .json)
 }
 
-if [[ -n "$HF_REPO_ID" ]]; then
-  HF_DST="$WORKSPACE/hf_sync"
-  if [[ ! -d "$HF_DST/.git" ]]; then
-    log "Clone HF repo: $HF_REPO_ID"
-    if [[ -n "$HF_TOKEN" ]]; then
-      GIT_LFS_SKIP_SMUDGE=1 git clone --depth=1 "https://user:${HF_TOKEN}@huggingface.co/${HF_REPO_ID}" "$HF_DST" || log "WARN: HF clone failed."
-    else
-      GIT_LFS_SKIP_SMUDGE=1 git clone --depth=1 "https://huggingface.co/${HF_REPO_ID}" "$HF_DST" || log "WARN: HF clone failed."
-    fi
-  else
-    log "Update HF repo …"
-    git -C "$HF_DST" pull --ff-only || true
-  fi
+# Liste aller Dateien im Model-Repo
+files = api.list_repo_files(repo_id=repo, repo_type="model")
 
-  if [[ -d "$HF_DST" ]]; then
-    sync_dir "$HF_DST/checkpoints"    "$MODELS_DIR/checkpoints"
-    sync_dir "$HF_DST/loras"          "$MODELS_DIR/loras"
-    sync_dir "$HF_DST/controlnet"     "$MODELS_DIR/controlnet"
-    sync_dir "$HF_DST/upscale_models" "$MODELS_DIR/upscale_models"
-    sync_dir "$HF_DST/faces"          "$MODELS_DIR/faces"
-    sync_dir "$HF_DST/vae"            "$MODELS_DIR/vae"
-    # Custom Nodes + Workflows (nur .json) – keine Dubletten
-    if [[ -d "$HF_DST/custom_nodes" ]]; then
-      rsync -a "$HF_DST/custom_nodes"/ "$COMFY_DIR/custom_nodes"/
-      log "Synced custom_nodes"
-    fi
-    if [[ -d "$HF_DST/workflows" ]]; then
-      mkdir -p "$COMFY_DIR/user/default/workflows"
-      rsync -a --include='*/' --include='*.json' --exclude='*' "$HF_DST/workflows"/ "$COMFY_DIR/user/default/workflows"/
-      log "Synced workflows → user/default/workflows"
-    fi
-  fi
-else
-  log "HF_REPO_ID leer – HF-Sync übersprungen."
-fi
+# Vorab: Größe grob aufsummieren, um ein Gefühl zu geben (nur bekannte Subpfade)
+est_total = 0
+cand = []
+for f in files:
+    sub = f.split("/")[0] if "/" in f else ""
+    if sub in MAP and not f.endswith("/"):
+        cand.append(f)
+# naive Abschätzung: Dateigrößen via try-download HEAD ist nicht verfügbar => zeigen nur Anzahl
+print(f"[INFO] Lade {len(cand)} Dateien aus {sorted(set([c.split('/')[0] for c in cand]))} … (Größen siehe während des Downloads)")
+
+# Download & Kopie
+cache = "/tmp/hf_cache_full"
+os.makedirs(cache, exist_ok=True)
+loaded = 0
+total_bytes = 0
+
+def copy_to(dst_dir, file_path):
+    os.makedirs(dst_dir, exist_ok=True)
+    base = os.path.basename(file_path)
+    dst  = os.path.join(dst_dir, base)
+    # Falls bereits vorhanden mit gleicher Größe: überspringen
+    if os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(file_path):
+        print(f"[SKIP] {base} (bereits vorhanden)")
+        return 0
+    shutil.copy2(file_path, dst)
+    return os.path.getsize(dst)
+
+# Modelle: alle Dateien laden
+for f in cand:
+    sub = f.split("/")[0]
+    dst_dir = MAP[sub]
+    try:
+        p = hf_hub_download(repo_id=repo, filename=f, repo_type="model",
+                            local_dir=cache, local_dir_use_symlinks=False)
+        sz = copy_to(dst_dir, p)
+        total_bytes += sz
+        loaded += 1
+        print(f"[OK]  {f}  (+{human(sz)})  ⇒ {dst_dir}")
+    except Exception as e:
+        print(f"[ERR] {f} -> {e}")
+
+# Workflows (nur .json) nach user/default/workflows
+w_dst = os.path.join(comfy,"user","default","workflows")
+os.makedirs(w_dst, exist_ok=True)
+w_cnt = 0
+for f in files:
+    if f.startswith("workflows/") and f.lower().endswith(".json"):
+        try:
+            p = hf_hub_download(repo_id=repo, filename=f, repo_type="model",
+                                local_dir=cache, local_dir_use_symlinks=False)
+            sz = copy_to(w_dst, p)
+            total_bytes += sz
+            w_cnt += 1
+            print(f"[WF] {f}  (+{human(sz)})  ⇒ {w_dst}")
+        except Exception as e:
+            print(f"[ERR] {f} -> {e}")
+
+print(f"[SUMMARY] Dateien geladen: {loaded} Models, {w_cnt} Workflows, Gesamt: {human(total_bytes)}")
+PY
+}
+
+# Aufruf (ersetzt bisherigen HF-Sync)
+download_all_from_hf
+
 
 # ---- Services starten ----
 # Jupyter zuerst (optional, Hintergrund)
