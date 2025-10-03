@@ -1,146 +1,91 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-log() { printf "[%s] %s\n" "$(date -u +'%F %T UTC')" "$*"; }
+log(){ echo "[$(date -u +'%F %T')] $*"; }
 
-# -------------------------------------------------
-# Defaults (per Runpod-Env überschreibbar)
-# -------------------------------------------------
-: "${COMFYUI_PORT:=8188}"
-: "${JUPYTER_PORT:=8888}"
-: "${RUN_JUPYTER:=1}"                 # <— Jupyter standardmäßig AN
-: "${HF_REPO_ID:=}"                   # z.B. Floorius/comfyui-model-bundle
-: "${HF_TOKEN:=}"                     # falls privates HF-Repo
-: "${JUPYTER_PASSWORD:=}"            # optional; Token-Auth wenn leer
-: "${PYTHONUNBUFFERED:=1}"
+WORKSPACE="${WORKSPACE:-/workspace}"
+COMFY_DIR="$WORKSPACE/ComfyUI"
+MODELS_DIR="$COMFY_DIR/models"
 
-export PYTHONUNBUFFERED
+HF_REPO_ID="${HF_REPO_ID:-}"     # z.B. Floorius/comfyui-model-bundle
+HF_TOKEN="${HF_TOKEN:-}"
+COMFYUI_PORT="${COMFYUI_PORT:-8188}"
+JUPYTER_PORT="${JUPYTER_PORT:-8888}"
+JUPYTER_TOKEN="${JUPYTER_TOKEN:-${JUPYTER_PASSWORD:-}}"
 
-ROOT="/workspace"
-CUI="$ROOT/ComfyUI"
-HF_DST="$ROOT/hf_sync"               # hierhin wird das HF-Bundle gespiegelt
+log "== Setup =="
 
-# -------------------------------------------------
-# ComfyUI bereitstellen (klonen, wenn fehlt)
-# -------------------------------------------------
-if [[ ! -d "$CUI" ]]; then
-  log "ComfyUI nicht gefunden – klone…"
-  git -C "$ROOT" clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git
+# Verzeichnisstruktur für Modelle sicherstellen
+mkdir -p "$MODELS_DIR"/{checkpoints,loras,controlnet,upscale_models,faces,vae,clip_vision,style_models,embeddings,diffusers,vae_approx}
+
+# ComfyUI klonen (falls fehlt)
+if [ ! -d "$COMFY_DIR/.git" ]; then
+  log "Cloning ComfyUI …"
+  git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
 fi
 
-# -------------------------------------------------
-# HF-Bundle synchronisieren (falls konfiguriert)
-# -------------------------------------------------
-if [[ -n "${HF_REPO_ID}" ]]; then
-  log "HF-Sync aus: ${HF_REPO_ID}"
-  mkdir -p "$HF_DST"
-  # privates Repo via Token klonen/aktualisieren
-  if [[ -d "$HF_DST/.git" ]]; then
-    git -C "$HF_DST" fetch --all || true
-    git -C "$HF_DST" reset --hard origin/main || true
+# Unerwünschtes Workflow-Paket entfernen (sonst kommen viele Beispiel-Workflows rein)
+if grep -q "comfyui-workflow-templates" "$COMFY_DIR/requirements.txt"; then
+  log "Patching requirements.txt (remove comfyui-workflow-templates) …"
+  sed -i '/comfyui-workflow-templates/d' "$COMFY_DIR/requirements.txt"
+fi
+
+# Python-Abhängigkeiten installieren (best effort)
+log "Install ComfyUI requirements …"
+python -m pip install --upgrade pip wheel setuptools
+python -m pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" || true
+
+# HuggingFace-Sync (nur vorhandene Ordner)
+if [ -n "$HF_REPO_ID" ] && [ -n "$HF_TOKEN" ]; then
+  HF_TMP="$WORKSPACE/hf_sync"
+  if [ ! -d "$HF_TMP/.git" ]; then
+    log "Clone HF repo: $HF_REPO_ID"
+    GIT_LFS_SKIP_SMUDGE=1 git clone --depth=1 "https://user:${HF_TOKEN}@huggingface.co/${HF_REPO_ID}" "$HF_TMP" || { log "WARN: HF clone failed."; HF_TMP=""; }
   else
-    if [[ -n "${HF_TOKEN}" ]]; then
-      git clone "https://user:${HF_TOKEN}@huggingface.co/${HF_REPO_ID}" "$HF_DST" || true
-    else
-      git clone "https://huggingface.co/${HF_REPO_ID}" "$HF_DST" || true
+    log "Pull HF repo updates …"
+    git -C "$HF_TMP" pull --ff-only || true
+  fi
+
+  if [ -n "${HF_TMP:-}" ] && [ -d "$HF_TMP" ]; then
+    copy_dir(){ local src="$1"; local dst="$2"; if [ -d "$HF_TMP/$src" ]; then
+        mkdir -p "$dst"; log "Sync $src  →  $dst"
+        rsync -a --delete "$HF_TMP/$src"/ "$dst"/ 2>/dev/null || true
+      fi
+    }
+    copy_dir "checkpoints"     "$MODELS_DIR/checkpoints"
+    copy_dir "loras"           "$MODELS_DIR/loras"
+    copy_dir "controlnet"      "$MODELS_DIR/controlnet"
+    copy_dir "upscale_models"  "$MODELS_DIR/upscale_models"
+    copy_dir "faces"           "$MODELS_DIR/faces"
+    copy_dir "vae"             "$MODELS_DIR/vae"
+
+    # custom_nodes
+    if [ -d "$HF_TMP/custom_nodes" ]; then
+      mkdir -p "$COMFY_DIR/custom_nodes"
+      log "Sync custom_nodes …"
+      rsync -a "$HF_TMP/custom_nodes"/ "$COMFY_DIR/custom_nodes"/ || true
+    fi
+
+    # workflows (nur .json)
+    if [ -d "$HF_TMP/workflows" ]; then
+      mkdir -p "$COMFY_DIR/workflows"
+      log "Sync workflows (.json) …"
+      rsync -a --include='*/' --include='*.json' --exclude='*' "$HF_TMP/workflows"/ "$COMFY_DIR/workflows"/ || true
     fi
   fi
-  # falls git-Ordner im HF_DST nicht existiert (z.B. Snapshot), ist auch ok.
 else
-  log "HF_REPO_ID leer – überspringe HF-Sync."
+  log "HF sync skipped (HF_TOKEN/HF_REPO_ID fehlen)."
 fi
 
-# -------------------------------------------------
-# Zielordner in ComfyUI anlegen
-# -------------------------------------------------
-mkdir -p \
-  "$CUI/models/checkpoints" \
-  "$CUI/models/loras" \
-  "$CUI/models/vae" \
-  "$CUI/models/controlnet" \
-  "$CUI/models/upscale_models" \
-  "$CUI/custom_nodes" \
-  "$CUI/user/default/workflows"
-
-# -------------------------------------------------
-# HF-Bundle → ComfyUI mappen (nur wenn HF_DST existiert)
-# -------------------------------------------------
-if [[ -d "$HF_DST" ]]; then
-  log "Mappe HF-Bundle in ComfyUI…"
-  rsync -a --delete --mkpath --exclude=".git" "$HF_DST/checkpoints/"     "$CUI/models/checkpoints/"     || true
-  rsync -a --delete --mkpath --exclude=".git" "$HF_DST/loras/"           "$CUI/models/loras/"           || true
-  rsync -a --delete --mkpath --exclude=".git" "$HF_DST/vae/"             "$CUI/models/vae/"             || true
-  rsync -a --delete --mkpath --exclude=".git" "$HF_DST/controlnet/"      "$CUI/models/controlnet/"      || true
-  rsync -a --delete --mkpath --exclude=".git" "$HF_DST/upscale_models/"  "$CUI/models/upscale_models/"  || true
-  rsync -a --delete --mkpath --exclude=".git" "$HF_DST/custom_nodes/"    "$CUI/custom_nodes/"           || true
-  rsync -a --delete --mkpath --exclude=".git" "$HF_DST/workflows/"       "$CUI/user/default/workflows/" || true
-  # optionale Ordner (falls vorhanden)
-  rsync -a --delete --mkpath --exclude=".git" "$HF_DST/faces/"           "$CUI/models/faces/"           || true
+# JupyterLab starten (optional)
+if [ -n "$JUPYTER_PORT" ]; then
+  log "Start JupyterLab :$JUPYTER_PORT"
+  jupyter lab --ip=0.0.0.0 --port="$JUPYTER_PORT" --no-browser --allow-root \
+    ${JUPYTER_TOKEN:+--ServerApp.token="$JUPYTER_TOKEN"} \
+    --ServerApp.open_browser=False > /var/log/jupyter.log 2>&1 &
 fi
 
-# -------------------------------------------------
-# Python-Abhängigkeiten (ComfyUI + Custom-Nodes)
-# -------------------------------------------------
-log "Installiere Python-Abhängigkeiten…"
-python3 -m pip install --upgrade pip wheel
-# Core
-if [[ -f "$CUI/requirements.txt" ]]; then
-  python3 -m pip install -r "$CUI/requirements.txt"
-fi
-# Custom-Nodes requirements
-if compgen -G "$CUI/custom_nodes/*/requirements*.txt" > /dev/null; then
-  for req in "$CUI"/custom_nodes/*/requirements*.txt; do
-    log "  → pip install -r ${req}"
-    python3 -m pip install -r "$req" || true
-  done
-fi
-
-# -------------------------------------------------
-# JupyterLab (optional)
-# -------------------------------------------------
-start_jupyter() {
-  # Jupyter installiert? (sollte aus dem Image kommen)
-  if ! command -v jupyter-lab >/dev/null 2>&1; then
-    log "JupyterLab fehlt – installiere…"
-    python3 -m pip install --no-cache-dir "jupyterlab>=4,<5" "jupyter_server>=2,<3"
-  fi
-  log "Starte JupyterLab auf :${JUPYTER_PORT}"
-  if [[ -n "${JUPYTER_PASSWORD}" ]]; then
-    # Token setzen (bequemer in Runpod)
-    jupyter-lab --no-browser --port="${JUPYTER_PORT}" --ip=0.0.0.0 \
-      --ServerApp.token="${JUPYTER_PASSWORD}" \
-      --ServerApp.allow_origin="*" \
-      --ServerApp.base_url="/" >/workspace/logs/jupyter.log 2>&1 &
-  else
-    # ohne Passwort/Token – nur wenn Port durch Runpod geschützt ist
-    jupyter-lab --no-browser --port="${JUPYTER_PORT}" --ip=0.0.0.0 \
-      --ServerApp.token="" --ServerApp.password="" \
-      --ServerApp.allow_origin="*" \
-      --ServerApp.base_url="/" >/workspace/logs/jupyter.log 2>&1 &
-  fi
-}
-
-# -------------------------------------------------
 # ComfyUI starten
-# -------------------------------------------------
-log "Starte ComfyUI auf :${COMFYUI_PORT}"
-cd "$CUI"
-python3 main.py --listen 0.0.0.0 --port "${COMFYUI_PORT}" >/workspace/logs/comfyui.log 2>&1 &
-
-# optional Jupyter
-if [[ "${RUN_JUPYTER}" == "1" ]]; then
-  start_jupyter
-else
-  log "RUN_JUPYTER=0 – JupyterLab deaktiviert."
-fi
-
-# Health-Ausgaben
-sleep 2
-log "== Laufende Prozesse =="
-ps -eo pid,cmd | grep -E "main.py|jupyter-lab" | grep -v grep || true
-log "== Ports =="
-ss -ltnp | grep -E ":${COMFYUI_PORT}|:${JUPYTER_PORT}" || true
-
-# Prozess offen halten
-log "Bereit. ComfyUI: ${COMFYUI_PORT} / Jupyter: ${JUPYTER_PORT}"
-tail -F /workspace/logs/comfyui.log /workspace/logs/jupyter.log 2>/dev/null || tail -f /dev/null
+log "Start ComfyUI :$COMFYUI_PORT"
+cd "$COMFY_DIR"
+exec python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT"
