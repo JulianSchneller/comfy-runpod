@@ -5,12 +5,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     COMFYUI_PORT=8188 \
     JUPYTER_PORT=8888
 
-# Systempakete (für OpenCV/ComfyUI) – ohne GUI-Ballast
+# System-Pakete
 RUN apt-get update && \
     apt-get install -y --no-install-recommends git curl rsync jq python3-venv build-essential libglib2.0-0 libgl1 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Pip-Index sauber + stabile Hub-Version (keine Torch-Reinstalls!)
+# Pip-Basis & stabile Hub-Version
 ENV PIP_INDEX_URL="https://pypi.org/simple" \
     PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu121"
 RUN python -m pip install --no-cache-dir -U pip wheel setuptools && \
