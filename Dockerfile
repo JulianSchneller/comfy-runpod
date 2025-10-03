@@ -9,9 +9,10 @@ RUN bash -lc 'mkdir -p $WORKSPACE/logs && apt-get update && \
     apt-get install -y --no-install-recommends git curl rsync jq tini python3-venv build-essential libglib2.0-0 libgl1 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*'
 
-# Startskript liegt im Volume und wird beim Start aufgerufen
-COPY start.sh /workspace/start.sh
-RUN chmod +x /workspace/start.sh
+# start.sh NICHT unter /workspace ablegen (wird von Volume /workspace überdeckt)
+COPY start.sh /opt/runpod/start.sh
+RUN chmod +x /opt/runpod/start.sh
 
 WORKDIR /workspace
-CMD ["/bin/bash"]
+ENTRYPOINT ["/usr/bin/tini","-s","--"]
+CMD ["bash","-lc","/opt/runpod/start.sh"]
