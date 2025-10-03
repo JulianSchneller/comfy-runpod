@@ -7,6 +7,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # System-Pakete
 RUN apt-get update && \
+# JupyterLab (für optionales Notebook)
+RUN python -m pip install --no-cache-dir --upgrade pip wheel \
+    && python -m pip install --no-cache-dir "jupyterlab>=4,<5" "jupyter_server>=2,<3"
     apt-get install -y --no-install-recommends git curl rsync jq python3-venv build-essential libglib2.0-0 libgl1 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
