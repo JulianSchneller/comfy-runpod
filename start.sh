@@ -1,3 +1,13 @@
+# --- HUGGINGFACE_HUB_FIX_BEGIN ---
+echo "[SETUP] Pip & huggingface_hub vorbereiten …"
+# Wir setzen explizit PyPI, um seltsame Mirrors zu vermeiden
+export PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.org/simple}"
+# Extra-Index optional (Torch-Wheels), stört aber die Suche nicht
+export PIP_EXTRA_INDEX_URL="${PIP_EXTRA_INDEX_URL:-https://download.pytorch.org/whl/cu121}"
+
+python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+python3 -m pip install --no-cache-dir "huggingface_hub>=0.39,<1.0"
+# --- HUGGINGFACE_HUB_FIX_END ---
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
