@@ -1,12 +1,21 @@
 # --- HUGGINGFACE_HUB_FIX_BEGIN ---
-echo "[SETUP] Pip & huggingface_hub vorbereiten …"
-# Wir setzen explizit PyPI, um seltsame Mirrors zu vermeiden
-export PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.org/simple}"
-# Extra-Index optional (Torch-Wheels), stört aber die Suche nicht
-export PIP_EXTRA_INDEX_URL="${PIP_EXTRA_INDEX_URL:-https://download.pytorch.org/whl/cu121}"
+echo "[SETUP] Fix pip index + exact huggingface_hub pin …"
+# erzwinge PyPI (und optional Torch-Index)
+export PIP_INDEX_URL="https://pypi.org/simple"
+export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu121"
 
-python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
-python3 -m pip install --no-cache-dir "huggingface_hub>=0.39,<1.0"
+python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# ❗ Exakter Pin, damit yanked-Version installierbar bleibt
+python -m pip install --no-cache-dir "huggingface_hub==0.44.1"
+
+# alle Fremd-Pins zu huggingface_hub in requirements entfernen
+if [ -f /workspace/ComfyUI/requirements.txt ]; then
+  sed -i '/^huggingface[-_]hub[<>=].*/d' /workspace/ComfyUI/requirements.txt || true
+fi
+if [ -f /workspace/requirements.txt ]; then
+  sed -i '/^huggingface[-_]hub[<>=].*/d' /workspace/requirements.txt || true
+fi
 # --- HUGGINGFACE_HUB_FIX_END ---
 #!/usr/bin/env bash
 set -Eeuo pipefail
