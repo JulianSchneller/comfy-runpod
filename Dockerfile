@@ -1,4 +1,4 @@
-FROM runpod/pytorch:2.4.0-py3.10-cuda12.1.105-runtime-ubuntu22.04
+FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     WORKSPACE=/workspace \
