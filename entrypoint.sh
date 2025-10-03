@@ -1,91 +1,118 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-log(){ echo "[$(date -u +'%F %T')] $*"; }
+log(){ printf "[%s] %s\n" "$(date -u +'%F %T UTC')" "$*"; }
 
+# ---- ENV / Defaults ----
 WORKSPACE="${WORKSPACE:-/workspace}"
 COMFY_DIR="$WORKSPACE/ComfyUI"
 MODELS_DIR="$COMFY_DIR/models"
+LOG_DIR="$WORKSPACE/logs"
 
 HF_REPO_ID="${HF_REPO_ID:-}"     # z.B. Floorius/comfyui-model-bundle
 HF_TOKEN="${HF_TOKEN:-}"
+
 COMFYUI_PORT="${COMFYUI_PORT:-8188}"
 JUPYTER_PORT="${JUPYTER_PORT:-8888}"
-JUPYTER_TOKEN="${JUPYTER_TOKEN:-${JUPYTER_PASSWORD:-}}"
+RUN_JUPYTER="${RUN_JUPYTER:-1}"        # 1 = Jupyter an
+JUPYTER_TOKEN="${JUPYTER_TOKEN:-${JUPYTER_PASSWORD:-}}"  # optional
 
-log "== Setup =="
+mkdir -p "$LOG_DIR"
 
-# Verzeichnisstruktur für Modelle sicherstellen
-mkdir -p "$MODELS_DIR"/{checkpoints,loras,controlnet,upscale_models,faces,vae,clip_vision,style_models,embeddings,diffusers,vae_approx}
-
-# ComfyUI klonen (falls fehlt)
-if [ ! -d "$COMFY_DIR/.git" ]; then
+# ---- ComfyUI klonen (idempotent) ----
+if [[ ! -d "$COMFY_DIR/.git" ]]; then
   log "Cloning ComfyUI …"
   git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
+else
+  log "ComfyUI vorhanden – kein Clone."
 fi
 
-# Unerwünschtes Workflow-Paket entfernen (sonst kommen viele Beispiel-Workflows rein)
+# ---- requirements.txt säubern (keine Beispiel-Workflows) ----
 if grep -q "comfyui-workflow-templates" "$COMFY_DIR/requirements.txt"; then
-  log "Patching requirements.txt (remove comfyui-workflow-templates) …"
+  log "Patch requirements.txt → entferne comfyui-workflow-templates"
   sed -i '/comfyui-workflow-templates/d' "$COMFY_DIR/requirements.txt"
 fi
 
-# Python-Abhängigkeiten installieren (best effort)
+# ---- Python-Requirements (best effort) ----
 log "Install ComfyUI requirements …"
-python -m pip install --upgrade pip wheel setuptools
-python -m pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" || true
+python -m pip install --no-cache-dir --upgrade pip wheel setuptools >>"$LOG_DIR/pip.log" 2>&1 || true
+python -m pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" >>"$LOG_DIR/pip.log" 2>&1 || true
+# Falls torchsde fehlt (manche KSampler brauchen es)
+python - <<'PY' || true
+import importlib, sys
+try:
+    importlib.import_module("torchsde")
+except Exception:
+    import subprocess
+    subprocess.run([sys.executable,"-m","pip","install","--no-cache-dir","torchsde"], check=False)
+PY
 
-# HuggingFace-Sync (nur vorhandene Ordner)
-if [ -n "$HF_REPO_ID" ] && [ -n "$HF_TOKEN" ]; then
-  HF_TMP="$WORKSPACE/hf_sync"
-  if [ ! -d "$HF_TMP/.git" ]; then
+# ---- Zielordner in ComfyUI (idempotent) ----
+mkdir -p "$MODELS_DIR"/{checkpoints,loras,controlnet,upscale_models,faces,vae,clip_vision,style_models,embeddings,diffusers,vae_approx}
+mkdir -p "$COMFY_DIR/user/default/workflows"
+mkdir -p "$COMFY_DIR/custom_nodes"
+
+# ---- HF-Sync: nur vorhandene Ordner kopieren ----
+sync_dir(){
+  local SRC="$1" DST="$2"
+  if [[ -d "$SRC" ]]; then
+    mkdir -p "$DST"
+    # --delete verhindert Ansammlungen; --whole-file vermeidet tmp-Duplikate; --prune-empty-dirs hält sauber
+    rsync -a --delete --prune-empty-dirs "$SRC"/ "$DST"/
+    log "Synced $(basename "$SRC") → $DST"
+  fi
+}
+
+if [[ -n "$HF_REPO_ID" ]]; then
+  HF_DST="$WORKSPACE/hf_sync"
+  if [[ ! -d "$HF_DST/.git" ]]; then
     log "Clone HF repo: $HF_REPO_ID"
-    GIT_LFS_SKIP_SMUDGE=1 git clone --depth=1 "https://user:${HF_TOKEN}@huggingface.co/${HF_REPO_ID}" "$HF_TMP" || { log "WARN: HF clone failed."; HF_TMP=""; }
+    if [[ -n "$HF_TOKEN" ]]; then
+      GIT_LFS_SKIP_SMUDGE=1 git clone --depth=1 "https://user:${HF_TOKEN}@huggingface.co/${HF_REPO_ID}" "$HF_DST" || log "WARN: HF clone failed."
+    else
+      GIT_LFS_SKIP_SMUDGE=1 git clone --depth=1 "https://huggingface.co/${HF_REPO_ID}" "$HF_DST" || log "WARN: HF clone failed."
+    fi
   else
-    log "Pull HF repo updates …"
-    git -C "$HF_TMP" pull --ff-only || true
+    log "Update HF repo …"
+    git -C "$HF_DST" pull --ff-only || true
   fi
 
-  if [ -n "${HF_TMP:-}" ] && [ -d "$HF_TMP" ]; then
-    copy_dir(){ local src="$1"; local dst="$2"; if [ -d "$HF_TMP/$src" ]; then
-        mkdir -p "$dst"; log "Sync $src  →  $dst"
-        rsync -a --delete "$HF_TMP/$src"/ "$dst"/ 2>/dev/null || true
-      fi
-    }
-    copy_dir "checkpoints"     "$MODELS_DIR/checkpoints"
-    copy_dir "loras"           "$MODELS_DIR/loras"
-    copy_dir "controlnet"      "$MODELS_DIR/controlnet"
-    copy_dir "upscale_models"  "$MODELS_DIR/upscale_models"
-    copy_dir "faces"           "$MODELS_DIR/faces"
-    copy_dir "vae"             "$MODELS_DIR/vae"
-
-    # custom_nodes
-    if [ -d "$HF_TMP/custom_nodes" ]; then
-      mkdir -p "$COMFY_DIR/custom_nodes"
-      log "Sync custom_nodes …"
-      rsync -a "$HF_TMP/custom_nodes"/ "$COMFY_DIR/custom_nodes"/ || true
+  if [[ -d "$HF_DST" ]]; then
+    sync_dir "$HF_DST/checkpoints"    "$MODELS_DIR/checkpoints"
+    sync_dir "$HF_DST/loras"          "$MODELS_DIR/loras"
+    sync_dir "$HF_DST/controlnet"     "$MODELS_DIR/controlnet"
+    sync_dir "$HF_DST/upscale_models" "$MODELS_DIR/upscale_models"
+    sync_dir "$HF_DST/faces"          "$MODELS_DIR/faces"
+    sync_dir "$HF_DST/vae"            "$MODELS_DIR/vae"
+    # Custom Nodes + Workflows (nur .json) – keine Dubletten
+    if [[ -d "$HF_DST/custom_nodes" ]]; then
+      rsync -a "$HF_DST/custom_nodes"/ "$COMFY_DIR/custom_nodes"/
+      log "Synced custom_nodes"
     fi
-
-    # workflows (nur .json)
-    if [ -d "$HF_TMP/workflows" ]; then
-      mkdir -p "$COMFY_DIR/workflows"
-      log "Sync workflows (.json) …"
-      rsync -a --include='*/' --include='*.json' --exclude='*' "$HF_TMP/workflows"/ "$COMFY_DIR/workflows"/ || true
+    if [[ -d "$HF_DST/workflows" ]]; then
+      mkdir -p "$COMFY_DIR/user/default/workflows"
+      rsync -a --include='*/' --include='*.json' --exclude='*' "$HF_DST/workflows"/ "$COMFY_DIR/user/default/workflows"/
+      log "Synced workflows → user/default/workflows"
     fi
   fi
 else
-  log "HF sync skipped (HF_TOKEN/HF_REPO_ID fehlen)."
+  log "HF_REPO_ID leer – HF-Sync übersprungen."
 fi
 
-# JupyterLab starten (optional)
-if [ -n "$JUPYTER_PORT" ]; then
-  log "Start JupyterLab :$JUPYTER_PORT"
-  jupyter lab --ip=0.0.0.0 --port="$JUPYTER_PORT" --no-browser --allow-root \
-    ${JUPYTER_TOKEN:+--ServerApp.token="$JUPYTER_TOKEN"} \
-    --ServerApp.open_browser=False > /var/log/jupyter.log 2>&1 &
+# ---- Services starten ----
+# Jupyter zuerst (optional, Hintergrund)
+if [[ "${RUN_JUPYTER}" == "1" ]]; then
+  log "Starte JupyterLab auf :${JUPYTER_PORT}"
+  if [[ -n "$JUPYTER_TOKEN" ]]; then
+    jupyter lab --ip=0.0.0.0 --port="$JUPYTER_PORT" --no-browser --allow-root           --ServerApp.token="$JUPYTER_TOKEN" --ServerApp.open_browser=False >"$LOG_DIR/jupyter.log" 2>&1 &
+  else
+    jupyter lab --ip=0.0.0.0 --port="$JUPYTER_PORT" --no-browser --allow-root           --ServerApp.token="" --ServerApp.password="" --ServerApp.open_browser=False >"$LOG_DIR/jupyter.log" 2>&1 &
+  fi
+else
+  log "RUN_JUPYTER=0 – Jupyter deaktiviert."
 fi
 
-# ComfyUI starten
-log "Start ComfyUI :$COMFYUI_PORT"
+# ComfyUI (Vordergrund, via exec = saubere PID)
+log "Starte ComfyUI auf :${COMFYUI_PORT}"
 cd "$COMFY_DIR"
-exec python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT"
+exec python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >"$LOG_DIR/comfyui.log" 2>&1
