@@ -73,7 +73,7 @@ mapping = {
   "faces":          models/"faces",
   "loras":          models/"loras",
   "upscale_models": models/"upscale_models",
-  "workflows":      cui/"workflows",
+  "workflows":      cui/"user/default/workflows",
   "custom_nodes":   cui/"custom_nodes",
 }
 
