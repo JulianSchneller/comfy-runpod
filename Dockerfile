@@ -1,4 +1,11 @@
 FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+# ---- Pip Index & Hf Hub Pin (robust) ----
+ENV PIP_INDEX_URL="https://pypi.org/simple" \
+    PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu121"
+
+RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    python -m pip install --no-cache-dir "huggingface_hub==0.35.3"
+# -----------------------------------------
 
 ENV DEBIAN_FRONTEND=noninteractive \
     WORKSPACE=/workspace \
