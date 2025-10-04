@@ -3,6 +3,13 @@
 [ -n "$BASH_VERSION" ] || exec bash "$0" "$@"
 
 set -Eeuo pipefail
+### HF_SKIP_DL_HEADER_GUARD ###
+: "${ENTRYPOINT_DRY:=0}"
+if [ -z "${HF_TOKEN:-}" ] || [ "${ENTRYPOINT_DRY}" = "1" ]; then
+  export HF_SKIP_DL=1
+  echo "[entrypoint] HF-Sync: skip (dry/no token)"
+fi
+### /HF_SKIP_DL_HEADER_GUARD ###
 # === ENTRYPOINT_DRY_HEADER_GUARD ===
 : "${ENTRYPOINT_DRY:=0}"
 if [ -z "${HF_TOKEN:-}" ] || [ "${ENTRYPOINT_DRY}" = "1" ]; then
