@@ -1,179 +1,134 @@
-\
-    #!/usr/bin/env bash
-    set -Eeuo pipefail
+#!/bin/sh
+# Re-exec in bash, falls mit /bin/sh gestartet (z.B. RunPod StartCommand).
+[ -n "$BASH_VERSION" ] || exec bash "$0" "$@"
 
-    # ========= Konfig / Umgebungsvariablen =========
-    COMFY_DIR="${COMFY_DIR:-/workspace/ComfyUI}"
-    HF_REPO_ID="${HF_REPO_ID:-}"
-    HF_TOKEN="${HF_TOKEN:-}"
-    ENABLE_JUPYTER="${ENABLE_JUPYTER:-0}"
-    PORT="${PORT:-8188}"
-    HOST="${HOST:-0.0.0.0}"
+set -Eeuo pipefail
+IFS=$'\n\t'
 
-    log() { echo -e "[entrypoint] $*"; }
+log(){ echo "[entrypoint] $*"; }
+warn(){ echo "[entrypoint][WARN] $*" >&2; }
 
-    # ========= Warten bis ComfyUI da ist =========
-    if [[ ! -d "$COMFY_DIR" ]]; then
-      log "ComfyUI nicht gefunden unter $COMFY_DIR … warte 3s"
-      sleep 3 || true
-    fi
-    if [[ ! -d "$COMFY_DIR" ]]; then
-      log "⚠️  ComfyUI fehlt weiterhin. Ich lege Ordner an."
-      mkdir -p "$COMFY_DIR"
-    fi
+# ----------------- ENV / Defaults -----------------
+PORT="${COMFYUI_PORT:-8188}"
+HF_SYNC="${HF_SYNC:-1}"              # 1 = aus HF ziehen
+HF_DELETE_EXTRAS="${HF_DELETE_EXTRAS:-0}"  # 1 = rsync --delete
+ENABLE_JUPYTER="${ENABLE_JUPYTER:-0}"
+INSTALL_NODE_REQS="${INSTALL_NODE_REQS:-1}"
 
-    # ========= Python ok? =========
-    if ! command -v python3 >/dev/null 2>&1; then
-      log "❌ python3 nicht gefunden."
-      exit 1
-    fi
+# ComfyUI Basis finden
+BASE="/workspace/ComfyUI"; [[ -d "$BASE" ]] || BASE="/app/ComfyUI"; [[ -d "$BASE" ]] || BASE="/content/ComfyUI"
+mkdir -p "$BASE"; cd "$BASE" || exit 1
 
-    # ========= HF Sync: nur, wenn HF_REPO_ID gesetzt =========
-    if [[ -n "$HF_REPO_ID" ]]; then
-      log "⬇️  HF Sync aus $HF_REPO_ID (nur benötigte Pfade) …"
+# Ordner
+MODELS="$BASE/models"
+CHECKPOINTS="$MODELS/checkpoints"; LORAS="$MODELS/loras"; CONTROLNET="$MODELS/controlnet"
+UPSCALE="$MODELS/upscale_models"; FACES="$MODELS/faces"; EMBED="$MODELS/embeddings"; ANNOTATORS="$MODELS/annotators"
+CUSTOM_NODES="$BASE/custom_nodes"; WORKFLOWS="$BASE/user/workflows"; WEB_USER="$BASE/web/extensions/user"
+AUX_CKPTS="$CUSTOM_NODES/comfyui_controlnet_aux/ckpts"
+mkdir -p "$CHECKPOINTS" "$LORAS" "$CONTROLNET" "$UPSCALE" "$FACES" "$EMBED" "$ANNOTATORS" "$CUSTOM_NODES" "$WORKFLOWS" "$WEB_USER" "$AUX_CKPTS"
 
-      python3 - <<'PY'
-import os, shutil, hashlib
-from pathlib import Path
-from huggingface_hub import snapshot_download
-
-HF_REPO_ID = os.environ.get("HF_REPO_ID","").strip()
-HF_TOKEN   = os.environ.get("HF_TOKEN","").strip()
-COMFY_DIR  = os.environ.get("COMFY_DIR","/workspace/ComfyUI").strip()
-
-stage = Path("/workspace/hf_bundle").resolve()
-stage.mkdir(parents=True, exist_ok=True)
-
-# Nur benötigte Inhalte ziehen (schneller & sparsamer)
-allow = [
-    "custom_nodes/ComfyUI-Advanced-ControlNet/**",
-    "custom_nodes/comfyui_controlnet_aux/**",
-    "annotators/ckpts/body_pose_model.pth",
-    "annotators/ckpts/hand_pose_model.pth",
-    "annotators/ckpts/dw-ll_ucoco_384.pth",
-    "annotators/ckpts/yolox_l.onnx",
-    "web_extensions/userstyle/**",
-    "workflows/*.json",
+# ----------------- NSFW-Bypass --------------------
+python3 - <<'PY' || true
+import importlib
+mods=[
+ "diffusers.pipelines.stable_diffusion.safety_checker",
+ "diffusers.pipelines.stable_diffusion_xl.safety_checker",
 ]
-
-path = snapshot_download(
-    repo_id=HF_REPO_ID,
-    token=(HF_TOKEN or None),
-    local_dir=str(stage),
-    local_dir_use_symlinks=False,
-    allow_patterns=allow,
-    ignore_patterns=None,
-    repo_type="model"
-)
-
-def copy_tree(src:Path, dst:Path):
-    dst.mkdir(parents=True, exist_ok=True)
-    for root, dirs, files in os.walk(src):
-        r = Path(root)
-        rel = r.relative_to(src)
-        (dst/rel).mkdir(parents=True, exist_ok=True)
-        for f in files:
-            s = r/f
-            d = (dst/rel)/f
-            if d.exists():
-                # nur überschreiben, wenn Inhalt anders
-                if os.path.getsize(s)==os.path.getsize(d):
-                    with open(s,'rb') as sf, open(d,'rb') as df:
-                        if hashlib.md5(sf.read()).hexdigest()==hashlib.md5(df.read()).hexdigest():
-                            continue
-            shutil.copy2(s, d)
-
-stage = Path(path)
-
-# custom_nodes
-for cn in ["ComfyUI-Advanced-ControlNet", "comfyui_controlnet_aux"]:
-    src = stage/"custom_nodes"/cn
-    if src.exists():
-        copy_tree(src, Path(COMFY_DIR)/"custom_nodes"/cn)
-
-# annotators ckpts → symlink unter models/annotators/ckpts
-ck = stage/"annotators"/"ckpts"
-models_ck = Path(COMFY_DIR)/"models"/"annotators"/"ckpts"
-models_ck.parent.mkdir(parents=True, exist_ok=True)
-if models_ck.is_symlink() or models_ck.exists():
-    pass
-else:
-    if ck.exists():
-        try:
-            os.symlink(str(ck), str(models_ck))
-        except Exception:
-            # Fallback: kopieren
-            ck_dst = models_ck
-            ck_dst.mkdir(parents=True, exist_ok=True)
-            copy_tree(ck, ck_dst)
-
-# web_extensions
-we = stage/"web_extensions"
-if we.exists():
-    copy_tree(we, Path(COMFY_DIR)/"web_extensions")
-
-# workflows
-wfs = stage/"workflows"
-if wfs.exists():
-    copy_tree(wfs, Path(COMFY_DIR)/"workflows")
-PY
-
-      log "✅ HF Sync done."
-    else
-      log "ℹ️ HF_REPO_ID ist leer – überspringe HF Sync."
-    fi
-
-    # ========= NSFW-Bypass Patch (defensiv, idempotent) =========
-    log "🛡️  NSFW-Bypass Patch anwenden (wenn Ziele existieren) …"
-    python3 - <<'PY'
-import re, os
-from pathlib import Path
-
-COMFY_DIR = Path(os.environ.get("COMFY_DIR","/workspace/ComfyUI"))
-
-targets = []
-# Sicherheits-/Filter-Dateien, je nach Build vorhanden/anders benannt
-candidates = [
-    COMFY_DIR/"comfy"/"safety.py",
-    COMFY_DIR/"comfy"/"safety_check.py",
-    COMFY_DIR/"custom_nodes"/"comfyui_controlnet_aux"/"safety.py",
-]
-
-for p in candidates:
-    if p.exists():
-        targets.append(p)
-
-def patch_text(txt:str)->str:
-    out = txt
-    # 1) Funktionen, die "unsafe" markieren, neutralisieren → geben einfach original zurück
-    out = re.sub(r"def\s+is_nsfw[^\:]*:[\s\S]+?return\s+.+", "def is_nsfw(*args, **kwargs):\n    return False\n", out, flags=re.M)
-    out = re.sub(r"def\s+filter_nsfw[^\:]*:[\s\S]+?return\s+.+", "def filter_nsfw(image,*a,**k):\n    return image\n", out, flags=re.M)
-    # 2) block_nsfw Default → False
-    out = re.sub(r"block_nsfw\s*:\s*Optional\[bool\]\s*=\s*None", "block_nsfw: Optional[bool] = False", out)
-    # 3) Harte Filter-Returns umgehen
-    out = re.sub(r"return\s+None\s*#\s*nsfw.*", "return image", out, flags=re.I)
-    return out
-
-for p in targets:
+for m in mods:
     try:
-        s = p.read_text(encoding="utf-8")
-        patched = patch_text(s)
-        if patched != s:
-            p.write_text(patched, encoding="utf-8")
-            print(f"patched: {p}")
-    except Exception as e:
-        print(f"skip {p}: {e}")
+        x=importlib.import_module(m)
+        if hasattr(x,"StableDiffusionSafetyChecker"):
+            def _f(self,clip_input,images):
+                try:n=len(images)
+                except: n=1
+                return images,[0.0]*n
+            x.StableDiffusionSafetyChecker.forward=_f
+            print("[entrypoint] NSFW bypass aktiv.")
+    except Exception:
+        pass
 PY
 
-    # ========= Optional: Jupyter =========
-    if [[ "${ENABLE_JUPYTER}" == "1" ]]; then
-      log "📓 Starte Jupyter (optional) …"
-      nohup jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root >/workspace/jupyter.log 2>&1 &
-    else
-      log "ℹ️ ENABLE_JUPYTER=0 – Jupyter wird nicht gestartet."
-    fi
+# ----------------- Requirements -------------------
+command -v rsync >/dev/null 2>&1 || { apt-get update -y && apt-get install -y rsync >/dev/null; }
+python3 -c "import huggingface_hub" 2>/dev/null || python3 -m pip install -U --no-cache-dir huggingface_hub >/dev/null
 
-    # ========= ComfyUI starten =========
-    cd "$COMFY_DIR"
-    log "🚀 Starte ComfyUI auf ${HOST}:${PORT}"
-    exec python3 main.py --listen "$HOST" --port "$PORT"
+if [[ "$INSTALL_NODE_REQS" == "1" ]]; then
+  for R in "$CUSTOM_NODES"/*/requirements.txt; do
+    [[ -f "$R" ]] || continue
+    log "pip install -r $R"
+    python3 -m pip install --no-input -r "$R" || true
+  done
+fi
+
+# ----------------- HF Sync ------------------------
+sync_hf(){
+  [[ "$HF_SYNC" == "1" ]] || { log "[HF] Sync aus"; return 0; }
+  [[ -n "${HF_REPO_ID:-}" ]] || { warn "[HF] HF_REPO_ID fehlt – breche ab"; return 0; }
+
+  STAGE="/tmp/hf_stage"; rm -rf "$STAGE"; mkdir -p "$STAGE"
+  log "[HF] snapshot_download: $HF_REPO_ID"
+  python3 - <<PY
+import os
+from huggingface_hub import snapshot_download
+repo=os.environ["HF_REPO_ID"]
+token=os.environ.get("HF_TOKEN") or None
+allow=[
+ "checkpoints/**","loras/**","controlnet/**",
+ "custom_nodes/**","web_extensions/**",
+ "workflows/**","Arbeitsabläufe/**",
+ "annotators/ckpts/**",
+ "upscale_models/**","faces/**","embeddings/**",
+]
+snapshot_download(repo_id=repo, token=token, local_dir="/tmp/hf_stage",
+                  local_dir_use_symlinks=False,
+                  allow_patterns=allow,
+                  ignore_patterns=[".git/**",".gitattributes","README.md"])
+print("[entrypoint] [HF] Snapshot ok.")
+PY
+
+  RSDEL=""
+  [[ "$HF_DELETE_EXTRAS" == "1" ]] && RSDEL="--delete"
+
+  rsync -a $RSDEL "$STAGE/checkpoints/"    "$CHECKPOINTS/"    2>/dev/null || true
+  rsync -a $RSDEL "$STAGE/loras/"          "$LORAS/"          2>/dev/null || true
+  rsync -a $RSDEL "$STAGE/controlnet/"     "$CONTROLNET/"     2>/dev/null || true
+  rsync -a $RSDEL "$STAGE/upscale_models/" "$UPSCALE/"        2>/dev/null || true
+  rsync -a $RSDEL "$STAGE/embeddings/"     "$EMBED/"          2>/dev/null || true
+  rsync -a $RSDEL "$STAGE/faces/"          "$FACES/"          2>/dev/null || true
+  rsync -a $RSDEL "$STAGE/custom_nodes/"   "$CUSTOM_NODES/"   2>/dev/null || true
+  rsync -a $RSDEL "$STAGE/workflows/"      "$WORKFLOWS/"      2>/dev/null || true
+  rsync -a $RSDEL "$STAGE/Arbeitsabläufe/" "$WORKFLOWS/"      2>/dev/null || true
+  [[ -d "$STAGE/web_extensions" ]] && rsync -a $RSDEL "$STAGE/web_extensions/" "$WEB_USER/"
+
+  # annotators/ckpts → Symlink auf AUX_CKPTS
+  rsync -a "$STAGE/annotators/ckpts/" "$AUX_CKPTS/" 2>/dev/null || true
+  if [[ -e "$ANNOTATORS/ckpts" && ! -L "$ANNOTATORS/ckpts" ]]; then
+    warn "[HF] $ANNOTATORS/ckpts existiert (kein Symlink) – lasse unverändert."
+  else
+    rm -f "$ANNOTATORS/ckpts"
+    ln -s "$AUX_CKPTS" "$ANNOTATORS/ckpts"
+    log "[HF] Symlink: $ANNOTATORS/ckpts -> $AUX_CKPTS"
+  fi
+
+  # Cleanup Caches
+  find "$BASE" -type f -name '*.part' -delete 2>/dev/null || true
+  rm -rf ~/.cache/huggingface/hub ~/.cache/torch 2>/dev/null || true
+  python3 -m pip cache purge >/dev/null 2>&1 || true
+  rm -rf "$STAGE"
+  log "[HF] Sync abgeschlossen."
+}
+
+# ----------------- Optional: Jupyter --------------
+if [[ "$ENABLE_JUPYTER" == "1" ]]; then
+  command -v jupyter >/dev/null 2>&1 || python3 -m pip install -U notebook >/dev/null
+  jupyter notebook --ip=0.0.0.0 --port="${JUPYTER_PORT:-8888}" \
+    --no-browser --allow-root --NotebookApp.token='' --NotebookApp.password='' \
+    >/tmp/jupyter.log 2>&1 &
+  log "Jupyter läuft auf Port ${JUPYTER_PORT:-8888}"
+fi
+
+# ----------------- Start --------------------------
+log "ComfyUI Base: $BASE"
+sync_hf
+log "Starte ComfyUI (Port ${PORT}) …"
+exec python3 main.py --listen 0.0.0.0 --port "${PORT}"
