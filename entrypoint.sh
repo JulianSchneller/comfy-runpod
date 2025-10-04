@@ -1,173 +1,145 @@
-#!/usr/bin/env bash
-set -euo pipefail
-IFS=$'\n\t'
+\
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
 
-log(){ echo "[$(date +'%F %T')] $*"; }
-retry(){ local n=0; local max="${2:-5}"; local sleep_s="${3:-2}"; until "$1"; do n=$((n+1)); if [[ $n -ge $max ]]; then return 1; fi; sleep $((sleep_s*n)); done; }
+    log(){ printf "%s %s\n" "$(date +'%F %T')" "$*"; }
 
-# -------------------------------
-# 0) Defaults / ENV
-# -------------------------------
-export PYTHONUNBUFFERED=1
-COMFY_DIR="${COMFY_DIR:-/workspace/ComfyUI}"
-DATA_DIR="${DATA_DIR:-/workspace}"
-HF_REPO_ID="${HF_REPO_ID:-}"        # z.B. Floorius/comfyui-model-bundle
-HF_TOKEN="${HF_TOKEN:-}"            # optional (privates Repo / große Dateien)
-HF_SYNC_FOLDERS="${HF_SYNC_FOLDERS:-custom_nodes annotators web_extensions workflows}"  # gezielte, leichte Pulls
-PORT="${PORT:-8188}"
-COMFY_FLAGS="${COMFY_FLAGS:---listen 0.0.0.0 --port ${PORT}}"
-ENABLE_JUPYTER="${ENABLE_JUPYTER:-0}"
-JUPYTER_PORT="${JUPYTER_PORT:-8888}"
+    # -------- Settings via ENV --------
+    : "${HF_REPO_ID:=}"            # z.B. Floorius/comfyui-model-bundle
+    : "${HF_BRANCH:=main}"
+    : "${HF_TOKEN:=}"              # optional; für private Repos
+    : "${HF_SYNC:=1}"              # 1=an, 0=aus
+    : "${ENABLE_JUPYTER:=0}"       # 1=startet JupyterLab auf :8888
+    : "${INSTALL_NODE_REQS:=0}"    # 1=installiert requirements.txt in custom_nodes/*
+    : "${COMFY_PORT:=8188}"
+    : "${COMFY_IP:=0.0.0.0}"
 
-log "🚀 entrypoint.sh start"
-mkdir -p "${DATA_DIR}" "${COMFY_DIR}"
+    COMFY_DIR="/workspace/ComfyUI"
+    HF_STAGE="/workspace/_hf_stage"
 
-# -------------------------------
-# 1) Stelle ComfyUI sicher
-# -------------------------------
-if [[ ! -d "${COMFY_DIR}/.git" && ! -f "${COMFY_DIR}/main.py" ]]; then
-  log "📦 ComfyUI fehlt → clone"
-  git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "${COMFY_DIR}"
-fi
+    log "🚀 entrypoint.sh gestartet"
 
-# -------------------------------
-# 2) HuggingFace Sync (gezielt & idempotent)
-# -------------------------------
-hf_clone_path="${DATA_DIR}/.hf_repo"
-hf_clone_cmd(){
-  if [[ -n "${HF_TOKEN}" ]]; then
-    GIT_ASKPASS=/bin/echo git clone --depth 1 "https://user:${HF_TOKEN}@huggingface.co/${HF_REPO_ID}" "${hf_clone_path}"
-  else
-    git clone --depth 1 "https://huggingface.co/${HF_REPO_ID}" "${hf_clone_path}"
-  fi
-}
-
-if [[ -n "${HF_REPO_ID}" ]]; then
-  log "🔗 HF_REPO_ID: ${HF_REPO_ID}"
-  if [[ -d "${hf_clone_path}/.git" ]]; then
-    log "🔄 HF pull"
-    pushd "${hf_clone_path}" >/dev/null
-    git lfs install --system || true
-    git pull || true
-    popd >/dev/null
-  else
-    log "⬇️  HF clone (light)"
-    git lfs install --system || true
-    if ! retry "bash -lc '$(declare -f hf_clone_cmd); hf_clone_cmd'"; then
-      log "⚠️  HF Clone fehlgeschlagen – fahre ohne HF fort."
+    # --------- ComfyUI bereitstellen ----------
+    if [[ ! -d "$COMFY_DIR" ]]; then
+      log "📦 Clone ComfyUI …"
+      git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
     fi
-  fi
-else
-  log "ℹ️ Kein HF_REPO_ID gesetzt – überspringe Sync."
-fi
 
-rs(){
-  # rs <src> <dst>
-  [[ -d "$1" ]] || return 0
-  mkdir -p "$2"
-  rsync -a --update --ignore-existing --no-perms --no-owner --no-group "$1"/ "$2"/ || true
-}
+    # ---------- Helper: sync ohne harte Abhängigkeit von rsync ----------
+    safe_sync() {
+      # $1: src, $2: dst
+      local src="$1"; local dst="$2"
+      [[ -d "$src" ]] || return 0
+      mkdir -p "$dst"
+      if command -v rsync >/dev/null 2>&1; then
+        rsync -a --delete "$src"/ "$dst"/
+      else
+        rm -rf "$dst"
+        mkdir -p "$dst"
+        cp -a "$src"/. "$dst"/
+      fi
+    }
 
-if [[ -d "${hf_clone_path}" ]]; then
-  log "🧩 Übernehme ausgewählte Ordner: ${HF_SYNC_FOLDERS}"
-  for d in ${HF_SYNC_FOLDERS}; do
-    case "$d" in
-      custom_nodes)
-        rs "${hf_clone_path}/custom_nodes" "${COMFY_DIR}/custom_nodes"
-        ;;
-      annotators)
-        # CKPTs für controlnet_aux (OpenPose/DWPose)
-        rs "${hf_clone_path}/annotators/ckpts" "${COMFY_DIR}/custom_nodes/comfyui_controlnet_aux/ckpts"
-        ;;
-      web_extensions)
-        # User-Styles & UI Mods
-        rs "${hf_clone_path}/web_extensions" "${COMFY_DIR}/web/extensions/user"
-        ;;
-      workflows)
-        # Workflows → ComfyUI user dir
-        rs "${hf_clone_path}/workflows" "${COMFY_DIR}/user/default/workflows"
-        ;;
-      checkpoints)
-        rs "${hf_clone_path}/checkpoints" "${COMFY_DIR}/models/checkpoints"
-        ;;
-      loras)
-        rs "${hf_clone_path}/loras" "${COMFY_DIR}/models/loras"
-        ;;
-      controlnet)
-        rs "${hf_clone_path}/controlnet" "${COMFY_DIR}/models/controlnet"
-        ;;
-      faces)
-        rs "${hf_clone_path}/faces" "${COMFY_DIR}/models/insightface"
-        ;;
-      upscale_models)
-        rs "${hf_clone_path}/upscale_models" "${COMFY_DIR}/models/upscale_models"
-        ;;
-      *)
-        log "   • unbekannt: $d (übersprungen)"
-        ;;
-    esac
-  done
-fi
+    # ---------- HF Sync (optional) ----------
+    if [[ "${HF_SYNC}" == "1" && -n "${HF_REPO_ID}" ]]; then
+      log "🔗 HF Sync aus ${HF_REPO_ID}@${HF_BRANCH}"
+      rm -rf "${HF_STAGE}"; mkdir -p "${HF_STAGE}"
 
-# -------------------------------
-# 3) Optional: Requirements der Custom-Nodes nachinstallieren
-# -------------------------------
-log "📦 Prüfe requirements.txt in custom_nodes …"
-find "${COMFY_DIR}/custom_nodes" -maxdepth 2 -type f -name "requirements.txt" | while read -r req; do
-  log "   pip install -r ${req}"
-  pip install --no-cache-dir -r "${req}" || true
-done
+      use_snapshot=0
+      if command -v git >/dev/null 2>&1; then
+        if [[ -n "${HF_TOKEN}" ]]; then
+          HF_URL="https://user:${HF_TOKEN}@huggingface.co/${HF_REPO_ID}"
+        else
+          HF_URL="https://huggingface.co/${HF_REPO_ID}"
+        fi
+        if git clone --depth 1 -b "${HF_BRANCH}" "${HF_URL}" "${HF_STAGE}" 2>/dev/null; then
+          log "✅ HF git clone OK"
+        else
+          log "ℹ️ git clone nicht möglich, fallback snapshot_download …"
+          use_snapshot=1
+        fi
+      else
+        use_snapshot=1
+      fi
 
-# -------------------------------
-# 4) NSFW-Bypass (best effort, no-op wenn nicht vorhanden)
-# -------------------------------
-log "⚠️  NSFW-Bypass aktivieren (best effort)"
-export DISABLE_NSFW_FILTER=1
-# Patch gängige safety_checker Implementationen (falls vorhanden)
-python - <<'PY' || true
-import os, re
+      if [[ "${use_snapshot}" == "1" ]]; then
+        python3 - <<'PY'
+import sys, subprocess, os
 from pathlib import Path
 
-candidates = []
-site = Path('/usr/local/lib/python3.*/dist-packages'.replace('*',''))
-for p in [
-    site / 'diffusers' / 'pipelines',
-    Path('/workspace') ,
-    Path('/opt')
-]:
-    if p.exists():
-        candidates.extend(p.rglob('safety_checker.py'))
-
-patched=0
-for f in candidates:
+def ensure_hub():
     try:
-        txt = f.read_text(encoding='utf-8', errors='ignore')
-        new = re.sub(r'return\s+(.+?),\s*has_nsfw_concepts', r'return \1, False', txt)
-        new = re.sub(r'return\s+has_nsfw_concepts', 'return False', new)
-        if new != txt:
-            f.write_text(new, encoding='utf-8')
-            patched += 1
+        import huggingface_hub  # noqa
     except Exception:
-        pass
-print(f"Patched files: {patched}")
+        subprocess.run([sys.executable,"-m","pip","install","-q","huggingface_hub==0.35.3"], check=True)
+
+ensure_hub()
+from huggingface_hub import snapshot_download
+
+repo_id  = os.environ.get("HF_REPO_ID","")
+branch   = os.environ.get("HF_BRANCH","main")
+token    = os.environ.get("HF_TOKEN") or None
+dest     = os.environ.get("HF_STAGE","/workspace/_hf_stage")
+Path(dest).mkdir(parents=True, exist_ok=True)
+snapshot_download(repo_id=repo_id, revision=branch, local_dir=dest, token=token, repo_type="model")
+print("✅ snapshot_download OK:", dest)
 PY
+      fi
 
-# -------------------------------
-# 5) Optional: Jupyter
-# -------------------------------
-if [[ "${ENABLE_JUPYTER}" == "1" ]]; then
-  log "📓 Starte Jupyter Lab auf :${JUPYTER_PORT}"
-  mkdir -p "${DATA_DIR}/.jupyter"
-  jupyter lab --ip=0.0.0.0 --port="${JUPYTER_PORT}" \
-    --NotebookApp.token='' --NotebookApp.password='' \
-    --ServerApp.token='' --ServerApp.password='' \
-    --no-browser --allow-root > "${DATA_DIR}/jupyter.log" 2>&1 &
-fi
+      # Inhalte gezielt in ComfyUI spiegeln
+      safe_sync "${HF_STAGE}/custom_nodes"        "${COMFY_DIR}/custom_nodes"
+      safe_sync "${HF_STAGE}/models"              "${COMFY_DIR}/models"
+      safe_sync "${HF_STAGE}/checkpoints"         "${COMFY_DIR}/models/checkpoints"
+      safe_sync "${HF_STAGE}/loras"               "${COMFY_DIR}/models/loras"
+      safe_sync "${HF_STAGE}/controlnet"          "${COMFY_DIR}/models/controlnet"
+      safe_sync "${HF_STAGE}/upscale_models"      "${COMFY_DIR}/models/upscale_models"
+      safe_sync "${HF_STAGE}/faces"               "${COMFY_DIR}/models/faces"
+      safe_sync "${HF_STAGE}/workflows"           "${COMFY_DIR}/user/workflows"
+      safe_sync "${HF_STAGE}/web_extensions"      "${COMFY_DIR}/web/extensions"
+      safe_sync "${HF_STAGE}/annotators/ckpts"    "${COMFY_DIR}/annotators/ckpts"
+      # fallback common layout
+      safe_sync "${HF_STAGE}/models/checkpoints"  "${COMFY_DIR}/models/checkpoints"
 
-# -------------------------------
-# 6) Start ComfyUI
-# -------------------------------
-log "▶️  Starte ComfyUI: ${COMFY_FLAGS}"
-cd "${COMFY_DIR}"
-# Logging
-python main.py ${COMFY_FLAGS} 2>&1 | tee -a "${DATA_DIR}/comfyui.log"
+      log "✅ HF Sync abgeschlossen"
+
+      # Optional: requirements aus custom_nodes installieren
+      if [[ "${INSTALL_NODE_REQS}" == "1" ]]; then
+        log "📦 Installiere requirements aus custom_nodes …"
+        shopt -s nullglob
+        for req in "${COMFY_DIR}"/custom_nodes/*/requirements*.txt; do
+          log "pip install -r ${req}"
+          pip install -r "${req}" -q || true
+        done
+        shopt -u nullglob
+      fi
+    else
+      log "⏩ HF Sync übersprungen (HF_SYNC!=1 oder HF_REPO_ID leer)"
+    fi
+
+    # ---------- NSFW-Bypass (best effort) ----------
+    log "⚠️ NSFW-Bypass anwenden (best effort)"
+    patched=0
+    while IFS= read -r -d '' f; do
+      sed -i 's/block_nsfw[[:space:]]*=[[:space:]]*True/block_nsfw=False/g' "$f" || true
+      sed -i 's/block_nsfw[[:space:]]*:[^=]*=[[:space:]]*True/block_nsfw: Optional[bool] = False/g' "$f" || true
+      sed -i 's/block_nsfw[[:space:]]*=[[:space:]]*None/block_nsfw=False/g' "$f" || true
+      sed -i 's/block_nsfw[[:space:]]*=[[:space:]]*\"True\"/block_nsfw=False/g' "$f" || true
+      if grep -q "block_nsfw" "$f"; then patched=$((patched+1)); fi
+    done < <(find "${COMFY_DIR}" -type f -name "*.py" -print0)
+    log "… Dateien mit Patches: ${patched}"
+
+    # ---------- Optional: Jupyter ----------
+    if [[ "${ENABLE_JUPYTER}" == "1" ]]; then
+      if ! command -v jupyter >/dev/null 2>&1; then
+        log "🧪 Installiere JupyterLab …"
+        pip install -q jupyterlab || true
+      fi
+      log "🧪 Starte JupyterLab auf :8888 (token-los; nur im Pod nutzen)"
+      nohup jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --ServerApp.token= --ServerApp.password= \
+        >/workspace/jupyter.log 2>&1 &
+    fi
+
+    # ---------- ComfyUI starten ----------
+    log "▶️ Starte ComfyUI auf ${COMFY_IP}:${COMFY_PORT}"
+    cd "${COMFY_DIR}"
+    exec python3 main.py --listen --port "${COMFY_PORT}"
