@@ -2,7 +2,7 @@
 #!/usr/bin/env bash
 
 # >>> COMFY_OPENPOSE_DWPOSE_SETUP:START
-# Installiere Custom-Nodes + lade OpenPose/DWPose-CKPTs
+# Installiere Custom-Nodes + lade OpenPose/DWPose-CKPTs (idempotent)
 set -e
 COMFY_ROOT="/workspace/ComfyUI"
 CNODES="$COMFY_ROOT/custom_nodes"
@@ -22,24 +22,28 @@ clone_if_missing() {
 clone_if_missing "https://github.com/Kosinkadink/ComfyUI-Advanced-ControlNet.git" "$CNODES/ComfyUI-Advanced-ControlNet"
 clone_if_missing "https://github.com/Fannovel16/comfyui_controlnet_aux.git"       "$CNODES/comfyui_controlnet_aux"
 
-if command -v pip >/dev/null 2>&1; then
-  pip install --no-cache-dir -r "$CNODES/comfyui_controlnet_aux/requirements.txt" || true
-  pip install --no-cache-dir -r "$CNODES/ComfyUI-Advanced-ControlNet/requirements.txt" || true
-fi
+# harte deps, damit die Nodes sicher laden
+python -m pip install --no-cache-dir --upgrade pip wheel setuptools || true
+python -m pip install --no-cache-dir \
+   controlnet-aux onnxruntime opencv-python-headless \
+   -r "$CNODES/comfyui_controlnet_aux/requirements.txt" \
+   -r "$CNODES/ComfyUI-Advanced-ControlNet/requirements.txt" || true
 
-dl_if_missing() {
+dl_if_missing() {  # url, out
   local url="$1"; local out="$2"
   [ -f "$out" ] && { echo "✔️  vorhanden: $out"; return; }
-  echo "⬇️  $out"; curl -L --retry 5 --connect-timeout 15 "$url" -o "$out"
+  echo "⬇️  $out"; curl -L --retry 5 --connect-timeout 20 "$url" -o "$out"
 }
 
+# OpenPose
 dl_if_missing "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/ckpts/body_pose_model.pth" "$CKPTS/body_pose_model.pth"
 dl_if_missing "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/ckpts/hand_pose_model.pth" "$CKPTS/hand_pose_model.pth"
-# facenet.pth optional
+# facenet.pth ist optional – überspringen falls 404
 
+# DWPose
 dl_if_missing "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.pth" "$CKPTS/dw-ll_ucoco_384.pth"
 dl_if_missing "https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx"        "$CKPTS/yolox_l.onnx"
-# optionaler Fallback:
+# probiere torchscript (optional), Fehler ignorieren
 curl -L --fail --retry 3 "https://huggingface.co/monster-labs/controlnet_aux_models/resolve/main/yolox_l.torchscript" -o "$CKPTS/yolox_l.torchscript" || true
 set +e
 # >>> COMFY_OPENPOSE_DWPOSE_SETUP:END
@@ -221,6 +225,29 @@ fi
 # ComfyUI (Vordergrund, via exec = saubere PID)
 log "Starte ComfyUI auf :${COMFYUI_PORT}"
 cd "$COMFY_DIR"
+# Web-Extensions (falls im HF-Bundle vorhanden, vor ComfyUI-Start)
+if [ -n "${HF_REPO_ID:-}" ] && [ -n "${HF_TOKEN:-}" ]; then
+  HF_TMP="/tmp/hf_webext"
+  mkdir -p "$HF_TMP"
+  python - <<'PY' || true
+import os, shutil
+from huggingface_hub import HfApi, hf_hub_download, login
+repo=os.environ.get("HF_REPO_ID",""); tok=os.environ.get("HF_TOKEN","")
+if repo and tok:
+    login(token=tok, add_to_git_credential=False)
+    api=HfApi()
+    for f in api.list_repo_files(repo_id=repo, repo_type="model"):
+        if f.startswith("web_extensions/") and f.lower().endswith(".py"):
+            p = hf_hub_download(repo_id=repo, filename=f, repo_type="model",
+                                local_dir="/tmp/hf_webext", local_dir_use_symlinks=False)
+PY
+  if [ -d "$HF_TMP/web_extensions" ]; then
+    mkdir -p "/workspace/ComfyUI/web/extensions"
+    rsync -a "$HF_TMP/web_extensions/" "/workspace/ComfyUI/web/extensions/"
+    echo "✔ Web-Extensions aktualisiert."
+  fi
+fi
+
 exec python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >"$LOG_DIR/comfyui.log" 2>&1
 
 echo "== 📦 Kopiere Web-Extensions =="
