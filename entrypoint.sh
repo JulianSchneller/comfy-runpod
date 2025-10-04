@@ -1,260 +1,146 @@
-# build-bump: 2025-10-04T15:44:49.966449Z
 #!/usr/bin/env bash
-
-# >>> COMFY_OPENPOSE_DWPOSE_SETUP:START
-# Installiere Custom-Nodes + lade OpenPose/DWPose-CKPTs (idempotent)
-set -e
-COMFY_ROOT="/workspace/ComfyUI"
-CNODES="$COMFY_ROOT/custom_nodes"
-CKPTS="$COMFY_ROOT/annotators/ckpts"
-mkdir -p "$CNODES" "$CKPTS"
-
-clone_if_missing() {
-  local url="$1"; local dir="$2"
-  if [ ! -d "$dir" ]; then
-    echo "⬇️  $url → $dir"
-    git clone --depth=1 "$url" "$dir" || true
-  else
-    echo "↻  pull $dir"; (cd "$dir" && git pull --ff-only || true)
-  fi
-}
-
-clone_if_missing "https://github.com/Kosinkadink/ComfyUI-Advanced-ControlNet.git" "$CNODES/ComfyUI-Advanced-ControlNet"
-clone_if_missing "https://github.com/Fannovel16/comfyui_controlnet_aux.git"       "$CNODES/comfyui_controlnet_aux"
-
-# harte deps, damit die Nodes sicher laden
-python -m pip install --no-cache-dir --upgrade pip wheel setuptools || true
-python -m pip install --no-cache-dir \
-   controlnet-aux onnxruntime opencv-python-headless \
-   -r "$CNODES/comfyui_controlnet_aux/requirements.txt" \
-   -r "$CNODES/ComfyUI-Advanced-ControlNet/requirements.txt" || true
-
-dl_if_missing() {  # url, out
-  local url="$1"; local out="$2"
-  [ -f "$out" ] && { echo "✔️  vorhanden: $out"; return; }
-  echo "⬇️  $out"; curl -L --retry 5 --connect-timeout 20 "$url" -o "$out"
-}
-
-# OpenPose
-dl_if_missing "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/ckpts/body_pose_model.pth" "$CKPTS/body_pose_model.pth"
-dl_if_missing "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/ckpts/hand_pose_model.pth" "$CKPTS/hand_pose_model.pth"
-# facenet.pth ist optional – überspringen falls 404
-
-# DWPose
-dl_if_missing "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.pth" "$CKPTS/dw-ll_ucoco_384.pth"
-dl_if_missing "https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx"        "$CKPTS/yolox_l.onnx"
-# probiere torchscript (optional), Fehler ignorieren
-curl -L --fail --retry 3 "https://huggingface.co/monster-labs/controlnet_aux_models/resolve/main/yolox_l.torchscript" -o "$CKPTS/yolox_l.torchscript" || true
-set +e
-# >>> COMFY_OPENPOSE_DWPOSE_SETUP:END
-
 set -Eeuo pipefail
+
+# ====== Basispfade ======
+export WORKSPACE="${WORKSPACE:-/workspace}"
+export COMFY_DIR="$WORKSPACE/ComfyUI"
+export MODELS_DIR="$COMFY_DIR/models"
+export LOG_DIR="$WORKSPACE/logs"
+export CNODES="$COMFY_DIR/custom_nodes"
+export CKPTS="$COMFY_DIR/annotators/ckpts"
+export HF_DIR="${HF_DIR:-$WORKSPACE/hf_bundle}"   # lokaler HF-Stage/Snapshot
+
+mkdir -p "$LOG_DIR" "$CNODES" "$CKPTS"
+mkdir -p "$MODELS_DIR"/{checkpoints,loras,controlnet,upscale_models,faces,vae,clip_vision,style_models,embeddings,diffusers,vae_approx}
+mkdir -p "$COMFY_DIR/user/default/workflows"
+mkdir -p "$COMFY_DIR/web/extensions"
 
 log(){ printf "[%s] %s\n" "$(date -u +'%F %T UTC')" "$*"; }
 
-# ---- ENV / Defaults ----
-WORKSPACE="${WORKSPACE:-/workspace}"
-COMFY_DIR="$WORKSPACE/ComfyUI"
-MODELS_DIR="$COMFY_DIR/models"
-LOG_DIR="$WORKSPACE/logs"
+# ====== ENV / Ports ======
+export HF_REPO_ID="${HF_REPO_ID:-}"      # z.B. Floorius/comfyui-model-bundle
+export HF_TOKEN="${HF_TOKEN:-}"          # hf_*
+export COMFYUI_PORT="${COMFYUI_PORT:-8188}"
+export JUPYTER_ENABLE="${JUPYTER_ENABLE:-0}"
+export JUPYTER_PORT="${JUPYTER_PORT:-8888}"
 
-HF_REPO_ID="${HF_REPO_ID:-}"     # z.B. Floorius/comfyui-model-bundle
-HF_TOKEN="${HF_TOKEN:-}"
-
-COMFYUI_PORT="${COMFYUI_PORT:-8188}"
-JUPYTER_PORT="${JUPYTER_PORT:-8888}"
-RUN_JUPYTER="${RUN_JUPYTER:-1}"        # 1 = Jupyter an
-JUPYTER_TOKEN="${JUPYTER_TOKEN:-${JUPYTER_PASSWORD:-}}"  # optional
-
-mkdir -p "$LOG_DIR"
-
-# ---- ComfyUI klonen (idempotent) ----
-if [[ ! -d "$COMFY_DIR/.git" ]]; then
-  log "Cloning ComfyUI …"
-  git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
-else
-  log "ComfyUI vorhanden – kein Clone."
-fi
-
-# ---- requirements.txt säubern (keine Beispiel-Workflows) ----
-if grep -q "comfyui-workflow-templates" "$COMFY_DIR/requirements.txt"; then
-  log "Patch requirements.txt → entferne comfyui-workflow-templates"
-  sed -i '/comfyui-workflow-templates/d' "$COMFY_DIR/requirements.txt"
-fi
-
-# ---- Python-Requirements (best effort) ----
-log "Install ComfyUI requirements …"
-python -m pip install --no-cache-dir --upgrade pip wheel setuptools >>"$LOG_DIR/pip.log" 2>&1 || true
-python -m pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" >>"$LOG_DIR/pip.log" 2>&1 || true
-# Falls torchsde fehlt (manche KSampler brauchen es)
-python - <<'PY' || true
-import importlib, sys
-try:
-    importlib.import_module("torchsde")
-except Exception:
-    import subprocess
-    subprocess.run([sys.executable,"-m","pip","install","--no-cache-dir","torchsde"], check=False)
-PY
-
-# ---- Zielordner in ComfyUI (idempotent) ----
-mkdir -p "$MODELS_DIR"/{checkpoints,loras,controlnet,upscale_models,faces,vae,clip_vision,style_models,embeddings,diffusers,vae_approx}
-mkdir -p "$COMFY_DIR/user/default/workflows"
-mkdir -p "$COMFY_DIR/custom_nodes"
-
-# ==== HF Direct Download – ALLES (große Dateien, Progress) ====
-# Lädt ALLE Dateien aus den Unterordnern und kopiert sie in die korrekten ComfyUI-Verzeichnisse.
-# Benötigt ausreichend Speicher (typisch 30–35 GB).
-
-download_all_from_hf() {
-  if [ -z "${HF_REPO_ID:-}" ] || [ -z "${HF_TOKEN:-}" ]; then
-    log "HF Direct Download übersprungen (HF_REPO_ID/HF_TOKEN fehlen)."
-    return
+# ====== Hilfsfunktionen ======
+dl_if_missing() {
+  local url="$1"; local out="$2"
+  if [[ -f "$out" ]]; then
+    echo "✔️  vorhanden: $out"
+    return 0
   fi
+  echo "⬇️  $out"
+  curl -L --fail --retry 5 --connect-timeout 15 "$url" -o "$out"
+}
 
+# ====== Custom Nodes: ControlNet + Aux ======
+echo "== 🧩 Custom Nodes (ControlNet/Aux) =="
+clone_or_update() {
+  local url="$1"; local dir="$2"
+  if [[ ! -d "$dir/.git" ]]; then
+    echo "⬇️  $url → $dir"
+    git clone --depth=1 "$url" "$dir" || true
+  else
+    echo "↻  pull $dir"
+    (cd "$dir" && git pull --ff-only || true)
+  fi
+}
+clone_or_update "https://github.com/Kosinkadink/ComfyUI-Advanced-ControlNet.git"   "$CNODES/ComfyUI-Advanced-ControlNet"
+clone_or_update "https://github.com/Fannovel16/comfyui_controlnet_aux.git"         "$CNODES/comfyui_controlnet_aux"
+
+# Requirements der Nodes (nicht hart failen, Log sammeln)
+if command -v pip >/dev/null 2>&1; then
+  pip install --no-cache-dir -r "$CNODES/comfyui_controlnet_aux/requirements.txt" >>"$LOG_DIR/pip.log" 2>&1 || true
+  pip install --no-cache-dir -r "$CNODES/ComfyUI-Advanced-ControlNet/requirements.txt" >>"$LOG_DIR/pip.log" 2>&1 || true
+fi
+
+# ====== OpenPose/DWPose CKPTs (Best Effort) ======
+echo "== 🧠 OpenPose/DWPose CKPTs =="
+mkdir -p "$CKPTS"
+dl_if_missing "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/ckpts/body_pose_model.pth" "$CKPTS/body_pose_model.pth" || true
+dl_if_missing "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/ckpts/hand_pose_model.pth" "$CKPTS/hand_pose_model.pth" || true
+curl -L --fail --retry 3 "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/ckpts/facenet.pth" -o "$CKPTS/facenet.pth" || true
+
+dl_if_missing "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.pth" "$CKPTS/dw-ll_ucoco_384.pth" || true
+dl_if_missing "https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx"        "$CKPTS/yolox_l.onnx" || true
+curl -L --fail --retry 3 "https://huggingface.co/monster-labs/controlnet_aux_models/resolve/main/yolox_l.torchscript" -o "$CKPTS/yolox_l.torchscript" || true
+
+# ====== HF-Bundle: kompletter Sync (Modelle + Workflows + web_extensions) ======
+download_all_from_hf() {
+  if [[ -z "${HF_REPO_ID:-}" || -z "${HF_TOKEN:-}" ]]; then
+    log "HF Direct Download übersprungen (HF_REPO_ID/HF_TOKEN fehlen)."
+    return 0
+  fi
   python - <<'PY'
-import os, sys, shutil, math, time
+import os, sys
+from pathlib import Path
 from huggingface_hub import HfApi, hf_hub_download, login
-
-def human(n):
-    units=["B","KB","MB","GB","TB"]; i=0
-    while n>=1024 and i<len(units)-1:
-        n/=1024; i+=1
-    return f"{n:.2f} {units[i]}"
 
 repo   = os.environ.get("HF_REPO_ID","")
 token  = os.environ.get("HF_TOKEN","")
 work   = os.environ.get("WORKSPACE","/workspace")
 comfy  = os.path.join(work,"ComfyUI")
-models = os.path.join(comfy,"models")
+stage  = os.environ.get("HF_DIR", os.path.join(work,"hf_bundle"))
 
 login(token=token, add_to_git_credential=False)
 api = HfApi()
 
-# Map: HF-Subfolder -> Zielverzeichnis
-MAP = {
-  "checkpoints":    os.path.join(models,"checkpoints"),
-  "loras":          os.path.join(models,"loras"),
-  "controlnet":     os.path.join(models,"controlnet"),
-  "upscale_models": os.path.join(models,"upscale_models"),
-  "faces":          os.path.join(models,"faces"),
-  "vae":            os.path.join(models,"vae"),
-  # Workflows separat behandelt (nur .json)
-}
+Path(stage).mkdir(parents=True, exist_ok=True)
+# Ordnerstruktur im Stage
+for p in ["checkpoints","loras","controlnet","upscale_models","faces","vae","clip_vision","style_models","embeddings","diffusers","vae_approx"]:
+    (Path(stage)/"models"/p).mkdir(parents=True, exist_ok=True)
+(Path(stage)/"web_extensions").mkdir(parents=True, exist_ok=True)
+(Path(stage)/"workflows").mkdir(parents=True, exist_ok=True)
 
-# Liste aller Dateien im Model-Repo
-files = api.list_repo_files(repo_id=repo, repo_type="model")
+def sync_dir(prefix, dest, allow_ext=None):
+    files = api.list_repo_files(repo_id=repo, repo_type="model")
+    hit = False
+    for f in files:
+        if f.startswith(prefix + "/"):
+            if allow_ext and not any(f.lower().endswith(ext) for ext in allow_ext):
+                continue
+            hf_hub_download(repo_id=repo, filename=f, local_dir=dest, local_dir_use_symlinks=False)
+            hit = True
+    return hit
 
-# Vorab: Größe grob aufsummieren, um ein Gefühl zu geben (nur bekannte Subpfade)
-est_total = 0
-cand = []
-for f in files:
-    sub = f.split("/")[0] if "/" in f else ""
-    if sub in MAP and not f.endswith("/"):
-        cand.append(f)
-# naive Abschätzung: Dateigrößen via try-download HEAD ist nicht verfügbar => zeigen nur Anzahl
-print(f"[INFO] Lade {len(cand)} Dateien aus {sorted(set([c.split('/')[0] for c in cand]))} … (Größen siehe während des Downloads)")
+base = str(Path(stage)/"models")
+sync_dir("checkpoints"   , base+"/checkpoints")
+sync_dir("loras"         , base+"/loras")
+sync_dir("controlnet"    , base+"/controlnet")
+sync_dir("upscale_models", base+"/upscale_models")
+sync_dir("faces"         , base+"/faces")
+sync_dir("vae"           , base+"/vae")
+sync_dir("clip_vision"   , base+"/clip_vision")
+sync_dir("style_models"  , base+"/style_models")
+sync_dir("embeddings"    , base+"/embeddings")
+sync_dir("diffusers"     , base+"/diffusers")
+sync_dir("vae_approx"    , base+"/vae_approx")
+sync_dir("workflows"     , str(Path(stage)/"workflows"), allow_ext=[".json"])
+sync_dir("web_extensions", str(Path(stage)/"web_extensions"))
 
-# Download & Kopie
-cache = "/tmp/hf_cache_full"
-os.makedirs(cache, exist_ok=True)
-loaded = 0
-total_bytes = 0
-
-def copy_to(dst_dir, file_path):
-    os.makedirs(dst_dir, exist_ok=True)
-    base = os.path.basename(file_path)
-    dst  = os.path.join(dst_dir, base)
-    # Falls bereits vorhanden mit gleicher Größe: überspringen
-    if os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(file_path):
-        print(f"[SKIP] {base} (bereits vorhanden)")
-        return 0
-    shutil.copy2(file_path, dst)
-    return os.path.getsize(dst)
-
-# Modelle: alle Dateien laden
-for f in cand:
-    sub = f.split("/")[0]
-    dst_dir = MAP[sub]
-    try:
-        p = hf_hub_download(repo_id=repo, filename=f, repo_type="model",
-                            local_dir=cache, local_dir_use_symlinks=False)
-        sz = copy_to(dst_dir, p)
-        total_bytes += sz
-        loaded += 1
-        print(f"[OK]  {f}  (+{human(sz)})  ⇒ {dst_dir}")
-    except Exception as e:
-        print(f"[ERR] {f} -> {e}")
-
-# Workflows (nur .json) nach user/default/workflows
-w_dst = os.path.join(comfy,"user","default","workflows")
-os.makedirs(w_dst, exist_ok=True)
-w_cnt = 0
-for f in files:
-    if f.startswith("workflows/") and f.lower().endswith(".json"):
-        try:
-            p = hf_hub_download(repo_id=repo, filename=f, repo_type="model",
-                                local_dir=cache, local_dir_use_symlinks=False)
-            sz = copy_to(w_dst, p)
-            total_bytes += sz
-            w_cnt += 1
-            print(f"[WF] {f}  (+{human(sz)})  ⇒ {w_dst}")
-        except Exception as e:
-            print(f"[ERR] {f} -> {e}")
-
-print(f"[SUMMARY] Dateien geladen: {loaded} Models, {w_cnt} Workflows, Gesamt: {human(total_bytes)}")
+print("[HF] Sync abgeschlossen →", stage)
 PY
 }
-
-# Aufruf (ersetzt bisherigen HF-Sync)
 download_all_from_hf
 
-
-# ---- Services starten ----
-# Jupyter zuerst (optional, Hintergrund)
-if [[ "${RUN_JUPYTER}" == "1" ]]; then
-  log "Starte JupyterLab auf :${JUPYTER_PORT}"
-  if [[ -n "$JUPYTER_TOKEN" ]]; then
-    jupyter lab --ip=0.0.0.0 --port="$JUPYTER_PORT" --no-browser --allow-root           --ServerApp.token="$JUPYTER_TOKEN" --ServerApp.open_browser=False >"$LOG_DIR/jupyter.log" 2>&1 &
-  else
-    jupyter lab --ip=0.0.0.0 --port="$JUPYTER_PORT" --no-browser --allow-root           --ServerApp.token="" --ServerApp.password="" --ServerApp.open_browser=False >"$LOG_DIR/jupyter.log" 2>&1 &
-  fi
-else
-  log "RUN_JUPYTER=0 – Jupyter deaktiviert."
-fi
-
-# ComfyUI (Vordergrund, via exec = saubere PID)
-log "Starte ComfyUI auf :${COMFYUI_PORT}"
-cd "$COMFY_DIR"
-# Web-Extensions (falls im HF-Bundle vorhanden, vor ComfyUI-Start)
-if [ -n "${HF_REPO_ID:-}" ] && [ -n "${HF_TOKEN:-}" ]; then
-  HF_TMP="/tmp/hf_webext"
-  mkdir -p "$HF_TMP"
-  python - <<'PY' || true
-import os, shutil
-from huggingface_hub import HfApi, hf_hub_download, login
-repo=os.environ.get("HF_REPO_ID",""); tok=os.environ.get("HF_TOKEN","")
-if repo and tok:
-    login(token=tok, add_to_git_credential=False)
-    api=HfApi()
-    for f in api.list_repo_files(repo_id=repo, repo_type="model"):
-        if f.startswith("web_extensions/") and f.lower().endswith(".py"):
-            p = hf_hub_download(repo_id=repo, filename=f, repo_type="model",
-                                local_dir="/tmp/hf_webext", local_dir_use_symlinks=False)
-PY
-  if [ -d "$HF_TMP/web_extensions" ]; then
-    mkdir -p "/workspace/ComfyUI/web/extensions"
-    rsync -a "$HF_TMP/web_extensions/" "/workspace/ComfyUI/web/extensions/"
-    echo "✔ Web-Extensions aktualisiert."
-  fi
-fi
-
-exec python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >"$LOG_DIR/comfyui.log" 2>&1
-
-echo "== 📦 Kopiere Web-Extensions =="
-if [ -d "$HF_DIR/web_extensions" ]; then
-  mkdir -p "$COMFY_DIR/web/extensions"
+# ====== Web-Extensions JETZT kopieren (VOR exec) ======
+echo "== 📦 Kopiere Web-Extensions (vor Start) =="
+if [[ -d "$HF_DIR/web_extensions" ]]; then
   rsync -a "$HF_DIR/web_extensions/" "$COMFY_DIR/web/extensions/"
   echo "   ✔ Web-Extensions aktualisiert."
 else
   echo "   (keine web_extensions im HF-Bundle gefunden)"
 fi
+
+# ====== Jupyter (optional) ======
+if [[ "${JUPYTER_ENABLE}" == "1" ]]; then
+  echo "== 🧪 Starte JupyterLab (Port ${JUPYTER_PORT}) =="
+  nohup jupyter-lab --ip=0.0.0.0 --port="$JUPYTER_PORT" --no-browser >"$LOG_DIR/jupyter.log" 2>&1 &
+fi
+
+# ====== ComfyUI starten (im Vordergrund) ======
+cd "$COMFY_DIR"
+echo "== 🚀 Starte ComfyUI (Port ${COMFYUI_PORT}) =="
+exec python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >"$LOG_DIR/comfyui.log" 2>&1
