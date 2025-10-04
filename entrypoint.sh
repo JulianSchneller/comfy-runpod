@@ -43,7 +43,24 @@ for m in mods:
                 except: n=1
                 return images,[0.0]*n
             x.StableDiffusionSafetyChecker.forward=_f
-            print("[entrypoint] NSFW bypass aktiv.")
+            print("[entrypoint] NSFW bypass aktiv.
+# --- ComfyUI Basis automatisch erkennen ---
+if [ -z "${COMFYUI_BASE:-}" ]; then
+  for p in /workspace/ComfyUI /content/ComfyUI ; do
+    if [ -f "$p/main.py" ]; then
+      COMFYUI_BASE="$p"
+      break
+    fi
+  done
+fi
+if [ ! -f "${COMFYUI_BASE:-}/main.py" ]; then
+  echo "[entrypoint] ❌ ComfyUI nicht gefunden. Getestete Pfade:"
+  echo "  - /workspace/ComfyUI"
+  echo "  - /content/ComfyUI"
+  echo "Bitte Image/Template prüfen."
+  exit 1
+fi
+echo "[entrypoint] ComfyUI Base: ${COMFYUI_BASE}"")
     except Exception:
         pass
 PY
@@ -130,4 +147,32 @@ fi
 log "ComfyUI Base: $BASE"
 sync_hf
 log "Starte ComfyUI (Port ${PORT}) …"
-exec python3 main.py --listen 0.0.0.0 --port "${PORT}"
+
+# --- Optional: System-Preqs für rlpycairo/svglib (falls nötig) ---
+need_cairo=0
+python3 - <<'PY' >/dev/null 2>&1 || need_cairo=1
+try:
+    import cairo, rlpycairo  # type: ignore
+    import svglib  # type: ignore
+except Exception:
+    raise SystemExit(1)
+PY
+if [ "$need_cairo" -ne 0 ] ; then
+  echo "[entrypoint] Installiere Cairo-Dev-Prereqs (apt) für svglib/rlpycairo …"
+  if command -v apt-get >/dev/null 2>&1 ; then
+    apt-get update -y && apt-get install -y --no-install-recommends libcairo2-dev pkg-config && rm -rf /var/lib/apt/lists/*
+  else
+    echo "[entrypoint] ⚠ apt-get nicht verfügbar – svglib/rlpycairo könnten fehlschlagen."
+  fi
+fi
+
+# --- Python-Dependencies für comfyui_controlnet_aux ---
+if [ -f "${COMFYUI_BASE}/custom_nodes/comfyui_controlnet_aux/requirements.txt" ]; then
+  echo "[entrypoint] pip install -r ${COMFYUI_BASE}/custom_nodes/comfyui_controlnet_aux/requirements.txt"
+  pip install --no-cache-dir -r "${COMFYUI_BASE}/custom_nodes/comfyui_controlnet_aux/requirements.txt" || true
+fi
+
+# --- ComfyUI starten ---
+PORT="${PORT:-8188}"
+echo "[entrypoint] Starte ComfyUI (Port ${PORT}) …"
+exec python3 "${COMFYUI_BASE}/main.py" --listen 0.0.0.0 --port "${PORT}"
