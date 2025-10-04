@@ -71,7 +71,7 @@ if [ ! -f "${COMFYUI_BASE:-}/main.py" ]; then
   echo "Bitte Image/Template prüfen."
   exit 1
 fi
-echo "[entrypoint] ComfyUI Base: ${COMFYUI_BASE}"")
+echo "[entrypoint] ComfyUI Base: ${COMFYUI_BASE}")
     except Exception:
         pass
 PY
