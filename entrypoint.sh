@@ -3,6 +3,12 @@
 [ -n "$BASH_VERSION" ] || exec bash "$0" "$@"
 
 set -Eeuo pipefail
+# === ENTRYPOINT_DRY_HEADER_GUARD ===
+: "${ENTRYPOINT_DRY:=0}"
+if [ -z "${HF_TOKEN:-}" ] || [ "${ENTRYPOINT_DRY}" = "1" ]; then
+  export HF_SKIP_DL=1
+fi
+# ===================================
 
 # --- ENTRYPOINT_DRY_GUARD ---
 : "${ENTRYPOINT_DRY:=0}"
@@ -71,7 +77,7 @@ if [ ! -f "${COMFYUI_BASE:-}/main.py" ]; then
   echo "Bitte Image/Template prüfen."
   exit 1
 fi
-echo "[entrypoint] ComfyUI Base: ${COMFYUI_BASE}")
+echo "[entrypoint] ComfyUI Base: ${COMFYUI_BASE}"
     except Exception:
         pass
 PY
