@@ -3,6 +3,17 @@
 [ -n "$BASH_VERSION" ] || exec bash "$0" "$@"
 
 set -Eeuo pipefail
+
+# --- ENTRYPOINT_DRY_GUARD ---
+: "${ENTRYPOINT_DRY:=0}"
+if [[ "${ENTRYPOINT_DRY}" == "1" ]]; then
+  export HF_SKIP_DL=1
+fi
+# Wenn kein HF_TOKEN gesetzt ist → ebenfalls Skip
+if [[ -z "${HF_TOKEN:-}" ]]; then
+  export HF_SKIP_DL=1
+fi
+
 IFS=$'\n\t'
 
 log(){ echo "[entrypoint] $*"; }
@@ -43,7 +54,7 @@ for m in mods:
                 except: n=1
                 return images,[0.0]*n
             x.StableDiffusionSafetyChecker.forward=_f
-            print("[entrypoint] NSFW bypass aktiv.
+
 # --- ComfyUI Basis automatisch erkennen ---
 if [ -z "${COMFYUI_BASE:-}" ]; then
   for p in /workspace/ComfyUI /content/ComfyUI ; do
