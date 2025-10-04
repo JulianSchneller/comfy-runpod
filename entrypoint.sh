@@ -5,11 +5,11 @@ IFS=$'\n\t'
 # ---------------------
 # Konfiguration & Pfade
 # ---------------------
-export HF_REPO_ID="${HF_REPO_ID:-}"        # z.B. Floorius/comfyui-model-bundle
-export HF_TOKEN="${HF_TOKEN:-}"            # optional (private Repos)
-export HF_SYNC="${HF_SYNC:-1}"             # 1=Modelle/Workflows/Web-Extensions aus HF syncen
-export ENABLE_JUPYTER="${ENABLE_JUPYTER:-0}"     # 1=Jupyter starten
-export INSTALL_NODE_REQS="${INSTALL_NODE_REQS:-1}"# 1=requirements.txt in custom_nodes installieren
+export HF_REPO_ID="${HF_REPO_ID:-}"          # z.B. Floorius/comfyui-model-bundle
+export HF_TOKEN="${HF_TOKEN:-}"              # optional (für private Repos)
+export HF_SYNC="${HF_SYNC:-1}"               # 1=Modelle/Workflows/Web-Extensions aus HF syncen
+export ENABLE_JUPYTER="${ENABLE_JUPYTER:-0}" # 1=Jupyter starten
+export INSTALL_NODE_REQS="${INSTALL_NODE_REQS:-1}" # 1=requirements.txt in custom_nodes installieren
 export COMFYUI_PORT="${COMFYUI_PORT:-8188}"
 
 COMFY_ROOT="/workspace/ComfyUI"
@@ -28,7 +28,8 @@ mkdir -p \
   "${MODELS}/embeddings" \
   "${ANNOT_CKPTS}" \
   "${CNODES}" \
-  "${USER_WEB_EXT}"
+  "${USER_WEB_EXT}" \
+  "${COMFY_ROOT}/workflows"
 
 # ---------------------
 # Hilfsfunktionen
@@ -52,24 +53,21 @@ start_jupyter(){
 
 nsfw_bypass(){
   # Patch für evtl. vorhandenen Diffusers Safety Checker (idempotent)
-  # Falls in dieser Build-Kette nicht genutzt, passiert einfach nichts.
   python - <<'PY'
-import glob, io, os, sys
+import glob
 paths = glob.glob("/usr/local/lib/python*/site-packages/diffusers/pipelines/stable_diffusion/safety_checker.py") + \
         glob.glob("/usr/local/lib/python*/dist-packages/diffusers/pipelines/stable_diffusion/safety_checker.py")
 patched = False
 for p in paths:
     try:
-        with open(p, "r", encoding="utf-8") as f:
-            s = f.read()
+        s = open(p, "r", encoding="utf-8").read()
         if "return images, has_nsfw_concept" in s and "[False]*len(images)" not in s:
             s = s.replace("return images, has_nsfw_concept", "return images, [False]*len(images)")
-            with open(p, "w", encoding="utf-8") as f:
-                f.write(s)
-            patched = True
+            open(p, "w", encoding="utf-8").write(s)
             print(f"[entrypoint] NSFW safety_checker.patch angewendet: {p}")
+            patched = True
             break
-    except Exception as e:
+    except Exception:
         pass
 print("[entrypoint] NSFW bypass aktiv." if patched else "[entrypoint] Kein Diffusers-SafetyChecker gefunden (ok).")
 PY
@@ -96,7 +94,7 @@ ensure_controlnet_aux_symlink(){
     ln -sfn "${ANNOT_CKPTS}" "${target}"
     log "Symlink gesetzt: ${target} -> ${ANNOT_CKPTS}"
   else
-    log "Hinweis: comfyui_controlnet_aux nicht gefunden (wird ggf. durch HF_SYNC bereitgestellt)."
+    log "Hinweis: comfyui_controlnet_aux nicht gefunden (kommt ggf. durch HF_SYNC)."
   fi
 }
 
@@ -110,20 +108,23 @@ sync_from_hf(){
     return 0
   fi
 
+  # Sicherstellen, dass huggingface_hub vorhanden ist
+  pip show huggingface_hub >/dev/null 2>&1 || pip install -U huggingface_hub
+
   log "HuggingFace-Sync aus '${HF_REPO_ID}' starten …"
   python - <<'PY'
-import os, shutil, sys, json, pathlib, time
+import os, shutil
 from pathlib import Path
 from huggingface_hub import snapshot_download
 
 repo_id = os.environ.get("HF_REPO_ID")
 token   = os.environ.get("HF_TOKEN") or None
+
 COMFY   = Path("/workspace/ComfyUI")
 MODELS  = COMFY / "models"
 CNODES  = COMFY / "custom_nodes"
 USERWEB = COMFY / "web" / "extensions" / "user"
 
-# Zielpfade
 dst = {
     "checkpoints": MODELS/"checkpoints",
     "loras": MODELS/"loras",
@@ -131,7 +132,7 @@ dst = {
     "upscale_models": MODELS/"upscale_models",
     "annotators/ckpts": MODELS/"annotators"/"ckpts",
     "custom_nodes/comfyui_controlnet_aux": CNODES/"comfyui_controlnet_aux",
-    "web_extensions/userstyle": USERWEB,  # erwartet userstyle.js
+    "web_extensions/userstyle": USERWEB,
     "workflows": COMFY/"workflows"
 }
 for p in dst.values(): p.mkdir(parents=True, exist_ok=True)
@@ -151,20 +152,18 @@ local_dir = snapshot_download(
 def copy_tree(src: Path, dst: Path, only_js=None):
     if not src.exists(): return
     dst.mkdir(parents=True, exist_ok=True)
-    for root, dirs, files in os.walk(src):
+    for root, _, files in os.walk(src):
         r = Path(root)
         rel = r.relative_to(src)
         (dst/rel).mkdir(parents=True, exist_ok=True)
         for f in files:
-            if only_js and not f.endswith(".js"): 
+            if only_js and not f.endswith(".js"):
                 continue
             s = r/f
             d = (dst/rel)/f
-            # nur kopieren, wenn Ziel fehlt oder Quelle neuer ist
             if not d.exists() or s.stat().st_mtime > d.stat().st_mtime:
                 shutil.copy2(s, d)
 
-# Mapping kopieren
 mapping = [
     ("checkpoints", "checkpoints"),
     ("loras", "loras"),
@@ -172,7 +171,7 @@ mapping = [
     ("upscale_models", "upscale_models"),
     ("annotators/ckpts", "annotators/ckpts"),
     ("custom_nodes/comfyui_controlnet_aux", "custom_nodes/comfyui_controlnet_aux"),
-    ("web_extensions/userstyle", "web_extensions/userstyle"),
+    ("web_extensions/userstyle", "web_extensions/userstyle"),  # nur .js
     ("workflows", "workflows"),
 ]
 for src_rel, dst_rel in mapping:
