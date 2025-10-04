@@ -1,8 +1,20 @@
 #!/bin/sh
+set -Eeuo pipefail
+
+# --- Robust Defaults (verhindert 'unbound variable' bei set -u) ---
+: "${WORKSPACE:=/workspace}"
+: "${COMFYUI_BASE:=${WORKSPACE}/ComfyUI}"
+: "${MODELS_DIR:=${WORKSPACE}/models}"
+: "${HF_REPO_ID:=Floorius/comfyui-model-bundle}"
+: "${HF_BRANCH:=main}"
+# akzeptiere HF_TOKEN oder HUGGINGFACE_HUB_TOKEN
+if [[ -z "${HF_TOKEN:-}" && -n "${HUGGINGFACE_HUB_TOKEN:-}" ]]; then
+  export HF_TOKEN="${HUGGINGFACE_HUB_TOKEN}"
+fi
+
+echo "[entrypoint] ComfyUI Base: ${COMFYUI_BASE}"
 # Re-exec in bash, falls mit /bin/sh gestartet (z.B. RunPod StartCommand).
 [ -n "$BASH_VERSION" ] || exec bash "$0" "$@"
-
-set -Eeuo pipefail
 ### HF_SKIP_DL_HEADER_GUARD ###
 : "${ENTRYPOINT_DRY:=0}"
 if [ -z "${HF_TOKEN:-}" ] || [ "${ENTRYPOINT_DRY}" = "1" ]; then
@@ -52,42 +64,40 @@ AUX_CKPTS="$CUSTOM_NODES/comfyui_controlnet_aux/ckpts"
 mkdir -p "$CHECKPOINTS" "$LORAS" "$CONTROLNET" "$UPSCALE" "$FACES" "$EMBED" "$ANNOTATORS" "$CUSTOM_NODES" "$WORKFLOWS" "$WEB_USER" "$AUX_CKPTS"
 
 # ----------------- NSFW-Bypass --------------------
-python3 - <<'PY' || true
-import importlib
-mods=[
- "diffusers.pipelines.stable_diffusion.safety_checker",
- "diffusers.pipelines.stable_diffusion_xl.safety_checker",
-]
-for m in mods:
-    try:
-        x=importlib.import_module(m)
-        if hasattr(x,"StableDiffusionSafetyChecker"):
-            def _f(self,clip_input,images):
-                try:n=len(images)
-                except: n=1
-                return images,[0.0]*n
-            x.StableDiffusionSafetyChecker.forward=_f
 
-# --- ComfyUI Basis automatisch erkennen ---
-if [ -z "${COMFYUI_BASE:-}" ]; then
-  for p in /workspace/ComfyUI /content/ComfyUI ; do
-    if [ -f "$p/main.py" ]; then
-      COMFYUI_BASE="$p"
-      break
-    fi
-  done
-fi
-if [ ! -f "${COMFYUI_BASE:-}/main.py" ]; then
-  echo "[entrypoint] ❌ ComfyUI nicht gefunden. Getestete Pfade:"
-  echo "  - /workspace/ComfyUI"
-  echo "  - /content/ComfyUI"
-  echo "Bitte Image/Template prüfen."
-  exit 1
-fi
-echo "[entrypoint] ComfyUI Base: ${COMFYUI_BASE}"
-    except Exception:
-        pass
+    # --- HF Snapshot (guarded) ---
+    if [[ -n "${HF_REPO_ID:-}" ]]; then
+      if [[ -n "${HF_TOKEN:-}" ]]; then
+        export HUGGINGFACE_HUB_TOKEN="${HF_TOKEN}"
+      fi
+      python3 - <<'PY'
+import os, sys
+repo = os.environ.get("HF_REPO_ID","").strip()
+branch = os.environ.get("HF_BRANCH","main").strip()
+token = os.environ.get("HF_TOKEN","") or os.environ.get("HUGGINGFACE_HUB_TOKEN","")
+if not repo:
+    print("[entrypoint] HF-Sync: skip (kein Repo gesetzt)")
+    sys.exit(0)
+print(f"[entrypoint] [HF] snapshot_download: {repo}")
+from huggingface_hub import snapshot_download
+local = os.environ.get("COMFYUI_BASE","/workspace/ComfyUI")
+# Models kommen ins /workspace Pfadbaum (wie im Rest des Skripts genutzt)
+target = os.path.join(local, "models")
+os.makedirs(target, exist_ok=True)
+try:
+    snapshot_download(
+        repo_id=repo,
+        revision=branch,
+        local_dir=target,
+        repo_type="model",
+        allow_patterns=["*"],
+    )
+    print("[entrypoint] [HF] Snapshot ok.")
+except Exception as e:
+    # Bei privaten Repos ohne Token: sauber abbrechen, Rest vom entrypoint darf weiterlaufen
+    print(f"[entrypoint] [HF] Snapshot skip/fehlgeschlagen: {e}")
 PY
+    fi
 
 # ----------------- Requirements -------------------
 command -v rsync >/dev/null 2>&1 || { apt-get update -y && apt-get install -y rsync >/dev/null; }
@@ -200,3 +210,18 @@ fi
 PORT="${PORT:-8188}"
 echo "[entrypoint] Starte ComfyUI (Port ${PORT}) …"
 exec python3 "${COMFYUI_BASE}/main.py" --listen 0.0.0.0 --port "${PORT}"
+
+
+    # --- NSFW UI bypass (nur CSS, optional) ---
+    if [[ -d "${COMFYUI_BASE}/web/extensions" ]]; then
+      mkdir -p "${COMFYUI_BASE}/web/extensions/userstyle"
+      CSS="${COMFYUI_BASE}/web/extensions/userstyle/userstyle.css"
+      if [[ ! -f "${CSS}" ]] || ! grep -q "nsfw-bypass" "${CSS}" 2>/dev/null; then
+        cat > "${CSS}" <<'CSS'
+/* nsfw-bypass */
+.safety-warning, .nsfw, .content-warning { display: none !important; }
+CSS
+        echo "[entrypoint] NSFW bypass aktiv."
+      fi
+    fi
+
