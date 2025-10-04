@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 set -Eeuo pipefail
 
 # ====== Basispfade ======
@@ -7,7 +8,7 @@ export COMFY_DIR="$WORKSPACE/ComfyUI"
 export MODELS_DIR="$COMFY_DIR/models"
 export LOG_DIR="$WORKSPACE/logs"
 export CNODES="$COMFY_DIR/custom_nodes"
-export CKPTS="$COMFY_DIR/annotators/ckpts"
+export CKPTS="$MODELS_DIR/annotators/ckpts"
 export HF_DIR="${HF_DIR:-$WORKSPACE/hf_bundle}"   # lokaler HF-Stage/Snapshot
 
 mkdir -p "$LOG_DIR" "$CNODES" "$CKPTS"
@@ -129,6 +130,23 @@ download_all_from_hf
 echo "== 📦 Kopiere Web-Extensions (vor Start) =="
 if [[ -d "$HF_DIR/web_extensions" ]]; then
   rsync -a "$HF_DIR/web_extensions/" "$COMFY_DIR/web/extensions/"
+echo "== 📦 Sync HF models & workflows =="
+if [[ -d "$HF_DIR/models" ]]; then
+  mkdir -p "$MODELS_DIR"
+  rsync -a --ignore-existing "$HF_DIR/models/" "$MODELS_DIR/"
+  echo "   ✔ Modelle → $MODELS_DIR"
+else
+  echo "   (keine models im HF-Bundle gefunden)"
+fi
+
+if [[ -d "$HF_DIR/workflows" ]]; then
+  mkdir -p "$COMFY_DIR/user/default/workflows"
+  rsync -a --include="*/" --include="*.json" --exclude="*" \
+        "$HF_DIR/workflows/" "$COMFY_DIR/user/default/workflows/"
+  echo "   ✔ Workflows → $COMFY_DIR/user/default/workflows"
+else
+  echo "   (keine workflows im HF-Bundle gefunden)"
+fi
   echo "   ✔ Web-Extensions aktualisiert."
 else
   echo "   (keine web_extensions im HF-Bundle gefunden)"
@@ -144,3 +162,15 @@ fi
 cd "$COMFY_DIR"
 echo "== 🚀 Starte ComfyUI (Port ${COMFYUI_PORT}) =="
 exec python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >"$LOG_DIR/comfyui.log" 2>&1
+mkdir -p "$HF_DIR"
+
+hf_get() { # hf_get <url> <out>
+  local url="$1"; local out="$2"
+  if [[ -f "$out" ]]; then echo "✔️  vorhanden: $out"; return 0; fi
+  echo "⬇️  $out"
+  if [[ -n "${HF_TOKEN:-}" ]]; then
+    curl -L --fail --retry 5 -H "Authorization: Bearer $HF_TOKEN" "$url" -o "$out"
+  else
+    curl -L --fail --retry 5 "$url" -o "$out"
+  fi
+}
