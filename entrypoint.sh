@@ -177,3 +177,12 @@ fi
 log "Starte ComfyUI auf :${COMFYUI_PORT}"
 cd "$COMFY_DIR"
 exec python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >"$LOG_DIR/comfyui.log" 2>&1
+
+echo "== 📦 Kopiere Web-Extensions =="
+if [ -d "$HF_DIR/web_extensions" ]; then
+  mkdir -p "$COMFY_DIR/web/extensions"
+  rsync -a "$HF_DIR/web_extensions/" "$COMFY_DIR/web/extensions/"
+  echo "   ✔ Web-Extensions aktualisiert."
+else
+  echo "   (keine web_extensions im HF-Bundle gefunden)"
+fi
