@@ -1,204 +1,155 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-IFS=$'\n\t'
 
-# ---------------------
-# Konfiguration & Pfade
-# ---------------------
-export HF_REPO_ID="${HF_REPO_ID:-}"          # z.B. Floorius/comfyui-model-bundle
-export HF_TOKEN="${HF_TOKEN:-}"              # optional (für private Repos)
-export HF_SYNC="${HF_SYNC:-1}"               # 1=Modelle/Workflows/Web-Extensions aus HF syncen
-export ENABLE_JUPYTER="${ENABLE_JUPYTER:-0}" # 1=Jupyter starten
-export INSTALL_NODE_REQS="${INSTALL_NODE_REQS:-1}" # 1=requirements.txt in custom_nodes installieren
-export COMFYUI_PORT="${COMFYUI_PORT:-8188}"
+# ---------- Konfiguration über ENV ----------
+COMFYUI_ROOT="${COMFYUI_ROOT:-/workspace/ComfyUI}"
+HF_REPO_ID="${HF_REPO_ID:-}"                  # z.B. Floorius/comfyui-model-bundle
+HF_SYNC="${HF_SYNC:-1}"                       # 1=Bundle syncen
+INSTALL_NODE_REQ="${INSTALL_NODE_REQ:-1}"     # 1=custom_nodes requirements installieren
+ENABLE_JUPYTER="${ENABLE_JUPYTER:-0}"         # 1=Jupyter startbar
+NSFW_BYPASS="${NSFW_BYPASS:-1}"               # 1=NSFW-SafetyChecker deaktivieren (wo vorhanden)
+HF_TOKEN="${HF_TOKEN:-}"                      # optional: für private HF-Repos (non-interactive)
 
-COMFY_ROOT="/workspace/ComfyUI"
-MODELS="${COMFY_ROOT}/models"
-CNODES="${COMFY_ROOT}/custom_nodes"
-USER_WEB_EXT="${COMFY_ROOT}/web/extensions/user"
-ANNOT_CKPTS="${MODELS}/annotators/ckpts"
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+export PYTHONUNBUFFERED=1
+export HF_HUB_DISABLE_TELEMETRY=1
 
-log(){ echo -e "[entrypoint] $*"; }
+echo "==> COMFYUI_ROOT:      $COMFYUI_ROOT"
+echo "==> HF_REPO_ID:        ${HF_REPO_ID:-<none>}"
+echo "==> HF_SYNC:           $HF_SYNC"
+echo "==> INSTALL_NODE_REQ:  $INSTALL_NODE_REQ"
+echo "==> ENABLE_JUPYTER:    $ENABLE_JUPYTER"
+echo "==> NSFW_BYPASS:       $NSFW_BYPASS"
 
-mkdir -p \
-  "${MODELS}/checkpoints" \
-  "${MODELS}/loras" \
-  "${MODELS}/controlnet" \
-  "${MODELS}/upscale_models" \
-  "${MODELS}/embeddings" \
-  "${ANNOT_CKPTS}" \
-  "${CNODES}" \
-  "${USER_WEB_EXT}" \
-  "${COMFY_ROOT}/workflows"
+# ---------- System-Dependencies für controlnet_aux / pycairo ----------
+echo "==> Installiere System-Dependencies (cairo/pango etc.) …"
+apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+  git curl ca-certificates jq rsync \
+  pkg-config libcairo2-dev libpango1.0-dev libglib2.0-dev libfreetype6-dev libffi-dev \
+  > /dev/null
+apt-get clean
+rm -rf /var/lib/apt/lists/*
 
-# ---------------------
-# Hilfsfunktionen
-# ---------------------
-start_jupyter(){
-  if [[ "${ENABLE_JUPYTER}" != "1" ]]; then return 0; fi
-  log "Jupyter Notebook aktivieren …"
-  if ! command -v jupyter >/dev/null 2>&1; then
-    pip install -U notebook >/dev/null
-  fi
-  jupyter notebook \
-    --NotebookApp.token='' \
-    --NotebookApp.password='' \
-    --ip=0.0.0.0 \
-    --port=8888 \
-    --no-browser \
-    --allow-root \
-    >/tmp/jupyter.log 2>&1 &
-  log "Jupyter läuft auf Port 8888 (ohne Token/Passwort)."
-}
+# ---------- ComfyUI-Quelle sicherstellen ----------
+if [[ ! -d "$COMFYUI_ROOT/.git" ]]; then
+  echo "==> ComfyUI nicht gefunden – clone …"
+  mkdir -p "$(dirname "$COMFYUI_ROOT")"
+  git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "$COMFYUI_ROOT"
+else
+  echo "==> ComfyUI vorhanden – Pull …"
+  git -C "$COMFYUI_ROOT" fetch --depth 1 origin
+  git -C "$COMFYUI_ROOT" reset --hard origin/master || git -C "$COMFYUI_ROOT" reset --hard origin/main || true
+fi
 
-nsfw_bypass(){
-  # Patch für evtl. vorhandenen Diffusers Safety Checker (idempotent)
-  python - <<'PY'
-import glob
-paths = glob.glob("/usr/local/lib/python*/site-packages/diffusers/pipelines/stable_diffusion/safety_checker.py") + \
-        glob.glob("/usr/local/lib/python*/dist-packages/diffusers/pipelines/stable_diffusion/safety_checker.py")
-patched = False
-for p in paths:
+# ---------- Python-Dependencies (ComfyUI) ----------
+echo "==> Python-Abhängigkeiten (ComfyUI) …"
+python3 -m pip install --upgrade pip wheel setuptools >/dev/null
+if [[ -f "$COMFYUI_ROOT/requirements.txt" ]]; then
+  python3 -m pip install -r "$COMFYUI_ROOT/requirements.txt"
+fi
+
+# ---------- NSFW-BYPASS (optional robust) ----------
+if [[ "$NSFW_BYPASS" == "1" ]]; then
+  echo "==> Aktiviere NSFW-Bypass (Diffusers SafetyChecker monkeypatch) …"
+  PATCH_FILE="$COMFYUI_ROOT/nsfw_bypass.py"
+  cat > "$PATCH_FILE" << 'PY'
+import types, sys
+def _patch():
     try:
-        s = open(p, "r", encoding="utf-8").read()
-        if "return images, has_nsfw_concept" in s and "[False]*len(images)" not in s:
-            s = s.replace("return images, has_nsfw_concept", "return images, [False]*len(images)")
-            open(p, "w", encoding="utf-8").write(s)
-            print(f"[entrypoint] NSFW safety_checker.patch angewendet: {p}")
-            patched = True
-            break
+        from diffusers.pipelines.stable_diffusion import safety_checker as sc
+        class _Dummy:
+            def __call__(self, images, **kwargs):
+                # Return images unverändert + alle 'not nsfw'
+                return images, [False] * len(images)
+        sc.StableDiffusionSafetyChecker = _Dummy
     except Exception:
         pass
-print("[entrypoint] NSFW bypass aktiv." if patched else "[entrypoint] Kein Diffusers-SafetyChecker gefunden (ok).")
+_patch()
 PY
-}
+  # ComfyUI lädt alles per Python; wir sorgen dafür, dass unser Patch beim Start importiert wird
+  export PYTHONPATH="$COMFYUI_ROOT:$PYTHONPATH"
+else
+  echo "==> NSFW-Bypass: deaktiviert"
+fi
 
-install_node_requirements(){
-  if [[ "${INSTALL_NODE_REQS}" != "1" ]]; then return 0; fi
-  log "Node-Requirements in custom_nodes installieren (falls vorhanden) …"
-  shopt -s nullglob
-  for d in "${CNODES}"/*; do
-    if [[ -f "${d}/requirements.txt" ]]; then
-      log "pip install -r ${d}/requirements.txt"
-      pip install -r "${d}/requirements.txt" || true
+# ---------- HF-Bundle synchronisieren ----------
+bundle_dir="/opt/hf-bundle"
+if [[ "$HF_SYNC" == "1" && -n "${HF_REPO_ID}" ]]; then
+  echo "==> Synchronisiere HuggingFace-Bundle: $HF_REPO_ID → $bundle_dir"
+  rm -rf "$bundle_dir"
+  mkdir -p "$bundle_dir"
+
+  if [[ -n "$HF_TOKEN" ]]; then
+    echo "$HF_TOKEN" | huggingface-cli login --token --stdin >/dev/null 2>&1 || true
+  fi
+
+  # git clone (xet/LFS handled server-side); Fallback auf snapshot-download wäre möglich
+  git clone --depth 1 "https://huggingface.co/${HF_REPO_ID}" "$bundle_dir"
+
+  # Mapping: Quelle → Ziel (nur existierende Quellen kopieren)
+  declare -A MAP
+  MAP["checkpoints"]="$COMFYUI_ROOT/models/checkpoints"
+  MAP["loras"]="$COMFYUI_ROOT/models/loras"
+  MAP["controlnet"]="$COMFYUI_ROOT/models/controlnet"
+  MAP["upscale_models"]="$COMFYUI_ROOT/models/upscale_models"
+  MAP["workflows"]="$COMFYUI_ROOT/workflows"
+  MAP["web-extensions"]="$COMFYUI_ROOT/web/extensions/user"
+  MAP["web_extensions"]="$COMFYUI_ROOT/web/extensions/user"    # falls anderer Ordnername
+  MAP["custom_nodes"]="$COMFYUI_ROOT/custom_nodes"
+  MAP["annotators/ckpts"]="$COMFYUI_ROOT/custom_nodes/comfyui_controlnet_aux/ckpts"
+
+  for src in "${!MAP[@]}"; do
+    if [[ -d "$bundle_dir/$src" ]]; then
+      dst="${MAP[$src]}"
+      mkdir -p "$dst"
+      echo "   • rsync $src → $dst"
+      rsync -a --ignore-existing "$bundle_dir/$src/" "$dst/"
     fi
   done
-  shopt -u nullglob
-}
 
-ensure_controlnet_aux_symlink(){
-  # Symlink: models/annotators/ckpts → custom_nodes/comfyui_controlnet_aux/ckpts
-  local target="${CNODES}/comfyui_controlnet_aux/ckpts"
-  if [[ -d "${CNODES}/comfyui_controlnet_aux" ]]; then
-    mkdir -p "${ANNOT_CKPTS}"
-    ln -sfn "${ANNOT_CKPTS}" "${target}"
-    log "Symlink gesetzt: ${target} -> ${ANNOT_CKPTS}"
-  else
-    log "Hinweis: comfyui_controlnet_aux nicht gefunden (kommt ggf. durch HF_SYNC)."
+  # Spezieller Fall: annotators/ckpts → falls vorhanden zusätzlich Link anlegen,
+  # weil einige Aux-Nodes genau diesen Pfad erwarten.
+  if [[ -d "$bundle_dir/annotators/ckpts" ]]; then
+    aux_ck="$COMFYUI_ROOT/custom_nodes/comfyui_controlnet_aux/ckpts"
+    mkdir -p "$(dirname "$aux_ck")"
+    if [[ ! -e "$aux_ck" ]]; then
+      ln -s "$bundle_dir/annotators/ckpts" "$aux_ck" || true
+      echo "   • Symlink gesetzt: $aux_ck -> bundle/annotators/ckpts"
+    fi
   fi
-}
+else
+  echo "==> HF_SYNC=0 oder kein HF_REPO_ID – überspringe Bundle-Sync."
+fi
 
-sync_from_hf(){
-  if [[ "${HF_SYNC}" != "1" ]]; then
-    log "HF_SYNC=0 → Überspringe HuggingFace-Sync."
-    return 0
+# ---------- Custom-Node Requirements ----------
+if [[ "$INSTALL_NODE_REQ" == "1" && -d "$COMFYUI_ROOT/custom_nodes" ]]; then
+  echo "==> Installiere requirements.txt von custom_nodes (falls vorhanden) …"
+  # controlnet_aux zuerst (wegen Cairo)
+  if [[ -d "$COMFYUI_ROOT/custom_nodes/comfyui_controlnet_aux" && -f "$COMFYUI_ROOT/custom_nodes/comfyui_controlnet_aux/requirements.txt" ]]; then
+    python3 -m pip install -r "$COMFYUI_ROOT/custom_nodes/comfyui_controlnet_aux/requirements.txt"
   fi
-  if [[ -z "${HF_REPO_ID}" ]]; then
-    log "⚠️  HF_SYNC=1 aber HF_REPO_ID ist leer → Überspringe Sync."
-    return 0
-  fi
+  # Restliche Nodes
+  find "$COMFYUI_ROOT/custom_nodes" -maxdepth 2 -name "requirements.txt" \
+    ! -path "*/comfyui_controlnet_aux/*" -print0 | while IFS= read -r -d '' req; do
+      echo "   • pip install -r $req"
+      python3 -m pip install -r "$req" || true
+    done
+else
+  echo "==> INSTALL_NODE_REQ=0 oder kein custom_nodes – überspringe."
+fi
 
-  # Sicherstellen, dass huggingface_hub vorhanden ist
-  pip show huggingface_hub >/dev/null 2>&1 || pip install -U huggingface_hub
+# ---------- Jupyter optional vorbereiten ----------
+if [[ "$ENABLE_JUPYTER" == "1" ]]; then
+  echo "==> Installiere JupyterLab …"
+  python3 -m pip install jupyterlab jupyter_http_over_ws >/dev/null
+  jupyter serverextension enable --py jupyter_http_over_ws >/dev/null 2>&1 || true
+else
+  echo "==> ENABLE_JUPYTER=0 – Jupyter wird nicht installiert."
+fi
 
-  log "HuggingFace-Sync aus '${HF_REPO_ID}' starten …"
-  python - <<'PY'
-import os, shutil
-from pathlib import Path
-from huggingface_hub import snapshot_download
-
-repo_id = os.environ.get("HF_REPO_ID")
-token   = os.environ.get("HF_TOKEN") or None
-
-COMFY   = Path("/workspace/ComfyUI")
-MODELS  = COMFY / "models"
-CNODES  = COMFY / "custom_nodes"
-USERWEB = COMFY / "web" / "extensions" / "user"
-
-dst = {
-    "checkpoints": MODELS/"checkpoints",
-    "loras": MODELS/"loras",
-    "controlnet": MODELS/"controlnet",
-    "upscale_models": MODELS/"upscale_models",
-    "annotators/ckpts": MODELS/"annotators"/"ckpts",
-    "custom_nodes/comfyui_controlnet_aux": CNODES/"comfyui_controlnet_aux",
-    "web_extensions/userstyle": USERWEB,
-    "workflows": COMFY/"workflows"
-}
-for p in dst.values(): p.mkdir(parents=True, exist_ok=True)
-
-tmp = Path("/tmp/hf_bundle")
-if tmp.exists(): shutil.rmtree(tmp)
-tmp.mkdir(parents=True, exist_ok=True)
-
-local_dir = snapshot_download(
-    repo_id=repo_id,
-    repo_type="model",
-    token=token,
-    local_dir=str(tmp),
-    local_dir_use_symlinks=False,
-)
-
-def copy_tree(src: Path, dst: Path, only_js=None):
-    if not src.exists(): return
-    dst.mkdir(parents=True, exist_ok=True)
-    for root, _, files in os.walk(src):
-        r = Path(root)
-        rel = r.relative_to(src)
-        (dst/rel).mkdir(parents=True, exist_ok=True)
-        for f in files:
-            if only_js and not f.endswith(".js"):
-                continue
-            s = r/f
-            d = (dst/rel)/f
-            if not d.exists() or s.stat().st_mtime > d.stat().st_mtime:
-                shutil.copy2(s, d)
-
-mapping = [
-    ("checkpoints", "checkpoints"),
-    ("loras", "loras"),
-    ("controlnet", "controlnet"),
-    ("upscale_models", "upscale_models"),
-    ("annotators/ckpts", "annotators/ckpts"),
-    ("custom_nodes/comfyui_controlnet_aux", "custom_nodes/comfyui_controlnet_aux"),
-    ("web_extensions/userstyle", "web_extensions/userstyle"),  # nur .js
-    ("workflows", "workflows"),
-]
-for src_rel, dst_rel in mapping:
-    s = tmp / src_rel
-    d = dst[dst_rel]
-    if src_rel == "web_extensions/userstyle":
-        copy_tree(s, d, only_js=True)
-    else:
-        copy_tree(s, d)
-
-print("[entrypoint] HF-Sync abgeschlossen.")
-PY
-}
-
-start_comfy(){
-  cd "${COMFY_ROOT}"
-  log "Starte ComfyUI auf Port ${COMFYUI_PORT} …"
-  python main.py --listen 0.0.0.0 --port "${COMFYUI_PORT}"
-}
-
-# ---------------------
-# Ablauf
-# ---------------------
-log "Entry gestartet. COMFYUI_ROOT=${COMFY_ROOT}"
-nsfw_bypass
-sync_from_hf
-ensure_controlnet_aux_symlink
-install_node_requirements
-start_jupyter
-start_comfy
+# ---------- Start ComfyUI ----------
+cd "$COMFYUI_ROOT"
+echo "==> Starte ComfyUI …"
+# Standard-HTTP-Port (z.B. 8188) wird vom Image/Template vorgegeben
+exec python3 main.py --listen 0.0.0.0 --port "${PORT:-8188}"
