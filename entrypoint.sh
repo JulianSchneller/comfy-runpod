@@ -80,7 +80,6 @@ allow=[
  "upscale_models/**","faces/**","embeddings/**",
 ]
 snapshot_download(repo_id=repo, token=token, local_dir="/tmp/hf_stage",
-                  local_dir_use_symlinks=False,
                   allow_patterns=allow,
                   ignore_patterns=[".git/**",".gitattributes","README.md"])
 print("[entrypoint] [HF] Snapshot ok.")
