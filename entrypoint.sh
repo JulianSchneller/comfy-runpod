@@ -203,3 +203,62 @@ fi
 log "Starte ComfyUI auf :${COMFYUI_PORT}"
 cd "$COMFY_DIR"
 exec python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >"$LOG_DIR/comfyui.log" 2>&1
+
+# ==== ControlNet-Aux: BEGIN ====
+set -e
+
+: "${WORKSPACE:=/workspace}"
+: "${COMFYUI_BASE:=${WORKSPACE}/ComfyUI}"
+
+CUSTOM_NODES="${COMFYUI_BASE}/custom_nodes"
+AUX_DIR="${CUSTOM_NODES}/comfyui_controlnet_aux"
+CKPT_DIR="${WORKSPACE}/annotators/ckpts"
+ALT_CKPT_DIR_A="${WORKSPACE}/annotators/models"
+ALT_CKPT_DIR_B="${WORKSPACE}/models/annotators/ckpts"
+WF_DIR="${WORKSPACE}/workflows"
+
+echo "[entrypoint] controlnet_aux: setup…"
+mkdir -p "${CUSTOM_NODES}"
+
+if [ -d "${AUX_DIR}/.git" ]; then
+  git -C "${AUX_DIR}" pull --ff-only || true
+elif [ -d "${AUX_DIR}" ]; then
+  echo "[entrypoint] controlnet_aux: exists (no git)."
+else
+  git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux.git "${AUX_DIR}"
+fi
+
+# CPU/GPU ONNXRuntime wählen (optional via CONTROLNET_AUX_USE_GPU=1)
+if [ "${CONTROLNET_AUX_USE_GPU:-0}" = "1" ]; then
+  pip install -q --no-cache-dir onnxruntime-gpu==1.18.1 opencv-python==4.10.0.84 numpy einops timm
+else
+  pip install -q --no-cache-dir onnxruntime==1.18.1       opencv-python==4.10.0.84 numpy einops timm
+fi
+
+# Annotator-CKPTs finden oder verlinken
+if [ ! -d "${CKPT_DIR}" ]; then
+  if   [ -d "${ALT_CKPT_DIR_A}" ]; then
+    mkdir -p "$(dirname "${CKPT_DIR}")"; ln -s "${ALT_CKPT_DIR_A}" "${CKPT_DIR}" 2>/dev/null || true
+  elif [ -d "${ALT_CKPT_DIR_B}" ]; then
+    mkdir -p "$(dirname "${CKPT_DIR}")"; ln -s "${ALT_CKPT_DIR_B}" "${CKPT_DIR}" 2>/dev/null || true
+  else
+    echo "[entrypoint] ⚠️ keine Annotator-CKPTs gefunden (optional)."
+  fi
+fi
+
+if [ -d "${CKPT_DIR}" ]; then
+  echo "[entrypoint] controlnet_aux: CKPTs unter ${CKPT_DIR}:"
+  (ls -1 "${CKPT_DIR}" 2>/dev/null || true) | sed 's/^/  - /'
+fi
+
+# Workflows komp. patchen (Node-Klassennamen-Änderungen)
+if [ -d "${WF_DIR}" ]; then
+  echo "[entrypoint] controlnet_aux: patch workflows in ${WF_DIR}…"
+  grep -RIl 'controlnet_aux\.OpenPosePreprocessor\|controlnet_aux\.DwposePreprocessor' "${WF_DIR}" 2>/dev/null \
+  | xargs -r sed -i \
+      -e 's/controlnet_aux\.OpenPosePreprocessor/controlnet_aux.OpenposePreprocessor/g' \
+      -e 's/controlnet_aux\.DwposePreprocessor/controlnet_aux.DWPosePreprocessor/g'
+fi
+
+echo "[entrypoint] controlnet_aux: OK."
+# ==== ControlNet-Aux: END ====
