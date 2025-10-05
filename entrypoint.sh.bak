@@ -1,50 +1,4 @@
 #!/usr/bin/env bash
-
-    # ---[PYBIN_SETUP]---
-    # Bevorzugt /opt/conda/bin/python3 (RunPod/Conda), sonst System-Python
-    if [ -z "${PYBIN:-}" ]; then
-      if [ -x "/opt/conda/bin/python3" ]; then
-        PYBIN="/opt/conda/bin/python3"
-      elif command -v "$PYBIN" >/dev/null 2>&1; then
-        PYBIN="$(command -v "$PYBIN")"
-      else
-        echo "[entrypoint] ❌ Kein "$PYBIN" gefunden."
-        exit 1
-      fi
-    fi
-    echo "[entrypoint] Python: ${PYBIN}"
-    "${PYBIN}" -c "import sys; print('Python-Version:', sys.version)"
-
-    # ComfyUI-Basis ermitteln, falls leer
-    : "${COMFYUI_BASE:=/workspace/ComfyUI}"
-
-    # PYTHONPATH so setzen, dass ComfyUI + custom_nodes importierbar sind
-    export PYTHONPATH="${COMFYUI_BASE}:${COMFYUI_BASE}/custom_nodes:${PYTHONPATH:-}"
-
-    # OpenCV-Test (nicht fatal, nur Hinweis)
-    "${PYBIN}" - <<'PY' || true
-try:
-    import cv2
-    print("[entrypoint] OpenCV OK:", cv2.__version__)
-except Exception as e:
-    print("[entrypoint] ⚠ OpenCV nicht importierbar:", e)
-PY
-
-    # Optionaler Sanity-Import für controlnet_aux (nicht fatal)
-    "${PYBIN}" - <<'PY' || true
-import sys, importlib, pathlib, os
-base = pathlib.Path(os.environ.get("COMFYUI_BASE", "/workspace/ComfyUI"))
-sys.path.insert(0, str(base))
-sys.path.insert(0, str(base / "custom_nodes"))
-try:
-    m = importlib.import_module("custom_nodes.comfyui_controlnet_aux.node_wrappers")
-    keys = sorted(getattr(m, "NODE_CLASS_MAPPINGS", {}).keys())
-    print("[entrypoint] controlnet_aux Klassen:", ", ".join(keys) if keys else "(keine gefunden)")
-except Exception as e:
-    print("[entrypoint] ⚠ controlnet_aux Import-Hinweis:", e)
-PY
-
-
 set -Eeuo pipefail
 
 log(){ printf "[%s] %s\n" "$(date -u +'%F %T UTC')" "$*"; }
@@ -313,13 +267,13 @@ fi
 
 # Requirements
 if [ -f "${AUX_DIR}/requirements.txt" ]; then
-  "$PYBIN" -m pip install --no-cache-dir -r "${AUX_DIR}/requirements.txt" || true
+  python3 -m pip install --no-cache-dir -r "${AUX_DIR}/requirements.txt" || true
 fi
 # ONNXRuntime CPU/GPU (optional via CONTROLNET_AUX_USE_GPU=1)
 if [ "${CONTROLNET_AUX_USE_GPU:-0}" = "1" ]; then
-  "$PYBIN" -m pip install --no-cache-dir onnxruntime-gpu==1.18.1 opencv-python==4.10.0.84 numpy einops timm || true
+  python3 -m pip install --no-cache-dir onnxruntime-gpu==1.18.1 opencv-python==4.10.0.84 numpy einops timm || true
 else
-  "$PYBIN" -m pip install --no-cache-dir onnxruntime==1.18.1       opencv-python==4.10.0.84 numpy einops timm || true
+  python3 -m pip install --no-cache-dir onnxruntime==1.18.1       opencv-python==4.10.0.84 numpy einops timm || true
 fi
 
 # CKPT-Verlinkung
@@ -378,9 +332,9 @@ fi
       break
     fi
   done
-  if command -v "$PYBIN" >/dev/null 2>&1 && [ -f "$PY" ]; then
+  if command -v python3 >/dev/null 2>&1 && [ -f "$PY" ]; then
     echo "[entrypoint] Patch controlnet_aux Workflows …"
-    "$PYBIN" "$PY" || true
+    python3 "$PY" || true
   fi
 }
 python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >"$LOG_DIR/comfyui.log" 2>&1
@@ -420,6 +374,3 @@ else
   echo "[entrypoint] Skip controlnet_aux (ComfyUI-Base nicht gefunden)."
 fi
 # <<< controlnet_aux setup (auto)
-# ---[PYBIN_RUN_HINT]---
-# Beispiel-Start (ggf. an vorhandenen Startcode anpassen):
-# cd "${COMFYUI_BASE:-/workspace/ComfyUI}" && exec "$PYBIN" main.py --listen 0.0.0.0 --port "${COMFYUI_PORT:-8188}"
