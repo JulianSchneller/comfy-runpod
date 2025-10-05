@@ -423,3 +423,137 @@ fi
 # ---[PYBIN_RUN_HINT]---
 # Beispiel-Start (ggf. an vorhandenen Startcode anpassen):
 # cd "${COMFYUI_BASE:-/workspace/ComfyUI}" && exec "$PYBIN" main.py --listen 0.0.0.0 --port "${COMFYUI_PORT:-8188}"
+
+# === controlnet_aux Pose Fix BEGIN ===
+# Diese Routine sorgt dafür, dass comfyui_controlnet_aux (OpenPose/DWPose)
+# inkl. Dependencies & Modelle vorhanden sind und Workflows/Node-Namen passen.
+# Idempotent & durch POSE_FIX steuerbar (1=an, 0=aus).
+: "${POSE_FIX:=1}"
+if [ "${POSE_FIX}" = "1" ]; then
+  # ComfyUI-Base herausfinden (Runpod: /workspace/ComfyUI, Colab: /content/ComfyUI)
+  COMFY="${COMFYUI_BASE:-/workspace/ComfyUI}"
+  [ -d "$COMFY" ] || COMFY="/content/ComfyUI"
+  mkdir -p "$COMFY/custom_nodes" "$COMFY/models/controlnet-aux"
+
+  CN_DIR="$COMFY/custom_nodes/comfyui_controlnet_aux"
+  # Repo holen/aktualisieren (ohne Auth; public Repo)
+  if [ ! -d "$CN_DIR" ]; then
+    if command -v git >/dev/null 2>&1; then
+      echo "[pose-fix] clone comfyui_controlnet_aux …"
+      git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux "$CN_DIR" || true
+    else
+      echo "[pose-fix] WARN: git fehlt – bitte manuell bereitstellen."
+    fi
+  else
+    if [ -d "$CN_DIR/.git" ]; then
+      echo "[pose-fix] update comfyui_controlnet_aux …"
+      git -C "$CN_DIR" pull --ff-only || true
+    fi
+  fi
+
+  # Dependencies (cv2/onnx + onnxruntime GPU/CPU)
+  PYBIN="${PYTHON_BIN:-python3}"
+  "$PYBIN" - <<'PY'
+import os, subprocess, sys, pathlib
+py = sys.executable
+cn = pathlib.Path(os.environ.get("CN_DIR", "")) if os.environ.get("CN_DIR") else None
+req = cn.joinpath("requirements.txt") if cn else None
+if req and req.exists():
+    subprocess.run([py,"-m","pip","install","-r",str(req)], check=False)
+# onnx + runtime
+subprocess.run([py,"-m","pip","install","-U","opencv-python","onnx"], check=False)
+gpu=False
+try:
+    import torch
+    gpu=torch.cuda.is_available()
+except Exception:
+    gpu=False
+subprocess.run([py,"-m","pip","install","-U", "onnxruntime-gpu" if gpu else "onnxruntime"], check=False)
+PY
+  export CN_DIR
+
+  # Download-Helfer (curl mit Fallback auf wget)
+  dl() {
+    url="$1"; out="$2";
+    [ -s "$out" ] && return 0
+    mkdir -p "$(dirname "$out")"
+    if command -v curl >/dev/null 2>&1; then
+      curl -L --fail --retry 3 "$url" -o "$out" || true
+    elif command -v wget >/dev/null 2>&1; then
+      wget -q --show-progress "$url" -O "$out" || true
+    else
+      echo "[pose-fix] WARN: weder curl noch wget verfügbar."
+      return 1
+    fi
+  }
+
+  # Modelle bereitstellen (Node-Ordner + ComfyUI/models/controlnet-aux spiegeln)
+  mkdir -p "$CN_DIR/models"
+  dl "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/openpose/body_pose_model.pth" "$CN_DIR/models/body_pose_model.pth"
+  dl "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/openpose/hand_pose_model.pth" "$CN_DIR/models/hand_pose_model.pth"
+  dl "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/openpose/face_pose_model.pth" "$CN_DIR/models/face_pose_model.pth"   # optional
+  dl "https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx"               "$CN_DIR/models/yolox_l.onnx"
+  dl "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.onnx"       "$CN_DIR/models/dw-ll_ucoco_384.onnx"
+  dl "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.pth"        "$CN_DIR/models/dw-ll_ucoco_384.pth"   # manche Builds wollen .pth
+
+  for f in body_pose_model.pth hand_pose_model.pth face_pose_model.pth yolox_l.onnx dw-ll_ucoco_384.onnx dw-ll_ucoco_384.pth; do
+    [ -s "$CN_DIR/models/$f" ] && cp -n "$CN_DIR/models/$f" "$COMFY/models/controlnet-aux/$f" || true
+  done
+
+  # Alias-Patch in node_wrappers/__init__.py (einmalig)
+  NW_INIT="$CN_DIR/node_wrappers/__init__.py"
+  if [ -f "$NW_INIT" ] && ! grep -q "BEGIN comfy-runpod legacy alias patch" "$NW_INIT"; then
+    cat >> "$NW_INIT" <<'PYCODE'
+
+# --- BEGIN comfy-runpod legacy alias patch ---
+try:
+    _m = NODE_CLASS_MAPPINGS
+    def _alias(dst, src):
+        if (src in _m) and (dst not in _m):
+            _m[dst] = _m[src]
+    _alias("OpenposePreprocessor", "OpenPosePreprocessor")
+    _alias("OpenposeDetector",     "OpenPoseDetector")
+    _alias("DWposePreprocessor",   "DWPosePreprocessor")
+    _alias("DWposeDetector",       "DWPoseDetector")
+except Exception as _e:
+    print("[controlnet_aux] alias patch warn:", _e)
+# --- END comfy-runpod legacy alias patch ---
+PYCODE
+  fi
+
+  # Workflows autom. korrigieren (Node-IDs vereinheitlichen)
+  fix_workflows() {
+    d="$1"; [ -d "$d" ] || return 0
+    "$PYBIN" - "$d" <<'PY'
+import sys,os,re
+base = sys.argv[1]
+subs = [
+ (r'"controlnet_aux\.OpenposePreprocessor"', '"controlnet_aux.OpenPosePreprocessor"'),
+ (r'"controlnet_aux\.OpenposeDetector"',     '"controlnet_aux.OpenPoseDetector"'),
+ (r'"controlnet_aux\.DWposePreprocessor"',   '"controlnet_aux.DWPosePreprocessor"'),
+ (r'"controlnet_aux\.DWposeDetector"',       '"controlnet_aux.DWPoseDetector"'),
+]
+for root,_,files in os.walk(base):
+    for fn in files:
+        if not fn.lower().endswith(".json"): continue
+        p=os.path.join(root,fn)
+        try:
+            with open(p,"r",encoding="utf-8") as f:
+                s=f.read()
+            s2=s
+            for pat,rep in subs:
+                s2=re.sub(pat,rep,s2)
+            if s2!=s:
+                with open(p,"w",encoding="utf-8") as f:
+                    f.write(s2)
+        except Exception as e:
+            print("[pose-fix] warn",p,":",e)
+PY
+  }
+  fix_workflows "$COMFY/workflows"
+  fix_workflows "/workspace/workflows"
+
+  echo "[pose-fix] OK – OpenPose/DWPose vorbereitet."
+fi
+# === controlnet_aux Pose Fix END ===
+
