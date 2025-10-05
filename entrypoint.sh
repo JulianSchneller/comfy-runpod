@@ -262,3 +262,50 @@ fi
 
 echo "[entrypoint] controlnet_aux: OK."
 # ==== ControlNet-Aux: END ====
+
+# >>> controlnet_aux install block >>>
+# Idempotent: installiert comfyui_controlnet_aux und richtet CKPT-Pfade ein
+set -eu
+
+COMFYUI_BASE="${COMFYUI_BASE:-/workspace/ComfyUI}"
+WORKSPACE="${WORKSPACE:-/workspace}"
+
+CN_DIR="${COMFYUI_BASE}/custom_nodes/comfyui_controlnet_aux"
+if [ ! -d "${CN_DIR}" ]; then
+  echo "[entrypoint] Install comfyui_controlnet_aux …"
+  mkdir -p "${COMFYUI_BASE}/custom_nodes"
+  if git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux "${CN_DIR}"; then
+    echo "[entrypoint] comfyui_controlnet_aux geklont."
+  else
+    echo "[entrypoint] FATAL: Clone comfyui_controlnet_aux fehlgeschlagen."; exit 1
+  fi
+  if [ -f "${CN_DIR}/requirements.txt" ]; then
+    python3 -m pip install --no-cache-dir -r "${CN_DIR}/requirements.txt" || true
+  fi
+fi
+
+AUX_SRC="${WORKSPACE}/annotators/ckpts"
+AUX_MODELS_DIR="${COMFYUI_BASE}/models/annotators"
+AUX_DST="${AUX_MODELS_DIR}/ckpts"
+ALT_ANN_DIR="${COMFYUI_BASE}/annotators"
+
+mkdir -p "${AUX_MODELS_DIR}"
+
+if [ ! -d "${AUX_SRC}" ]; then
+  echo "[entrypoint] WARN: ${AUX_SRC} nicht gefunden (kommt i.d.R. durch HF-Sync)."
+fi
+
+if [ -d "${AUX_SRC}" ] && [ ! -e "${AUX_DST}" ]; then
+  ln -s "${AUX_SRC}" "${AUX_DST}"
+  echo "[entrypoint] Symlink gesetzt: ${AUX_DST} → ${AUX_SRC}"
+fi
+
+if [ -d "${AUX_SRC}" ] && [ ! -e "${ALT_ANN_DIR}/ckpts" ]; then
+  mkdir -p "${ALT_ANN_DIR}"
+  ln -s "${AUX_SRC}" "${ALT_ANN_DIR}/ckpts"
+  echo "[entrypoint] Symlink gesetzt: ${ALT_ANN_DIR}/ckpts → ${AUX_SRC}"
+fi
+
+echo "[entrypoint] controlnet_aux bereit."
+# <<< controlnet_aux install block <<<
+
