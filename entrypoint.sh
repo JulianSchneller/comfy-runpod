@@ -67,6 +67,7 @@ if [ "${HF_SYNC}" = "1" ] && [ "${ENTRYPOINT_DRY}" = "0" ]; then
     echo "[entrypoint] ⚠️ HF-Sync übersprungen (kein Token gesetzt)."
   else
     echo "[entrypoint] [HF] snapshot_download: ${HF_REPO_ID}"
+python3 -m pip install --no-cache-dir --upgrade huggingface_hub || { echo "[entrypoint] ⚠️ WARN: konnte huggingface_hub nicht installieren"; }
     python3 - <<PY
 from huggingface_hub import snapshot_download
 snapshot_download(
