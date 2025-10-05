@@ -1,208 +1,205 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ====== Basispfade (wie in v7) ======
-export WORKSPACE="${WORKSPACE:-/workspace}"
-export COMFY_DIR="$WORKSPACE/ComfyUI"
-export MODELS_DIR="$COMFY_DIR/models"
-export LOG_DIR="$WORKSPACE/logs"
-export CNODES="$COMFY_DIR/custom_nodes"
-export CKPTS="$MODELS_DIR/annotators/ckpts"
-export HF_DIR="${HF_DIR:-$WORKSPACE/hf_bundle}"
-
-mkdir -p "$LOG_DIR" "$CNODES" "$CKPTS"
-mkdir -p "$MODELS_DIR"/{checkpoints,loras,controlnet,upscale_models,faces,vae,clip_vision,style_models,embeddings,diffusers,vae_approx}
-mkdir -p "$COMFY_DIR/user/default/workflows" "$COMFY_DIR/web/extensions" "$HF_DIR"
-
 log(){ printf "[%s] %s\n" "$(date -u +'%F %T UTC')" "$*"; }
 
-# ====== ENV / Ports ======
-export HF_REPO_ID="${HF_REPO_ID:-}"      # z.B. Floorius/comfyui-model-bundle
-export HF_TOKEN="${HF_TOKEN:-${HUGGINGFACE_HUB_TOKEN:-}}"
-export HF_REQUIRE_TOKEN="${HF_REQUIRE_TOKEN:-1}"  # 1: Token Pflicht (vermeidet 401 in privaten Repos)
-export COMFYUI_PORT="${COMFYUI_PORT:-8188}"
-export JUPYTER_ENABLE="${JUPYTER_ENABLE:-0}"
-export JUPYTER_PORT="${JUPYTER_PORT:-8888}"
+# ---- ENV / Defaults ----
+WORKSPACE="${WORKSPACE:-/workspace}"
+COMFY_DIR="$WORKSPACE/ComfyUI"
+MODELS_DIR="$COMFY_DIR/models"
+LOG_DIR="$WORKSPACE/logs"
 
-# ====== NSFW-Bypass via sitecustomize.py ======
-PY_PATCH_DIR="$WORKSPACE/py_patches"
-mkdir -p "$PY_PATCH_DIR"
-cat > "$PY_PATCH_DIR/sitecustomize.py" <<'PY'
-# Neutralisiert Diffusers SafetyChecker & entfernt safety_checker-Instanz in SD/SDXL-Pipelines.
-try:
-    from importlib import import_module
-    try:
-        sc_mod = import_module("diffusers.pipelines.stable_diffusion.safety_checker")
-        _Orig = getattr(sc_mod, "StableDiffusionSafetyChecker", None)
-    except Exception:
-        _Orig = None
-    if _Orig is not None:
-        class _Bypass(_Orig):  # type: ignore
-            def forward(self, *args, **kwargs):
-                images = kwargs.get("images", None)
-                if images is None and args:
-                    images = args[-1]
-                return images, [False] * (len(images) if hasattr(images, "__len__") else 1)
-            __call__ = forward
-        sc_mod.StableDiffusionSafetyChecker = _Bypass
+HF_REPO_ID="${HF_REPO_ID:-}"                         # z.B. Floorius/comfyui-model-bundle
+HF_TOKEN="${HF_TOKEN:-${HUGGINGFACE_HUB_TOKEN:-}}"   # Token auch aus HUGGINGFACE_HUB_TOKEN lesen
+HF_BRANCH="${HF_BRANCH:-main}"
 
-    def _nullify(modpath):
-        try:
-            pm = import_module(modpath)
-            for name in dir(pm):
-                cls = getattr(pm, name, None)
-                if getattr(cls, "__init__", None) and hasattr(cls.__init__, "__code__"):
-                    if "safety_checker" in cls.__init__.__code__.co_varnames:
-                        _init = cls.__init__
-                        def _wrap(self, *a, **k):
-                            _init(self, *a, **k)
-                            try: setattr(self, "safety_checker", None)
-                            except Exception: pass
-                        cls.__init__ = _wrap
-        except Exception:
-            pass
+COMFYUI_PORT="${COMFYUI_PORT:-8188}"
+JUPYTER_PORT="${JUPYTER_PORT:-8888}"
+RUN_JUPYTER="${RUN_JUPYTER:-1}"                      # 1 = Jupyter an
+JUPYTER_TOKEN="${JUPYTER_TOKEN:-${JUPYTER_PASSWORD:-}}"
 
-    for p in [
-        "diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion",
-        "diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_xl",
-        "diffusers.pipelines.auto_pipeline",
-    ]:
-        _nullify(p)
-except Exception:
-    pass
-PY
-export PYTHONPATH="$PY_PATCH_DIR:$PYTHONPATH"
+NSFW_BYPASS="${NSFW_BYPASS:-1}"                      # 1 = optionaler Bypass aktiv
 
-# ====== Helper ======
-copy_into(){ # rsync (wenn da) sonst cp -rn
-  local src="$1" dst="$2"
-  mkdir -p "$dst"
-  if command -v rsync >/dev/null 2>&1; then
-    rsync -a --ignore-existing "$src"/ "$dst"/
-  else
-    shopt -s dotglob || true
-    cp -rn "$src"/* "$dst"/ 2>/dev/null || true
-  fi
-}
+# HF Cache in Workspace, nicht in /root
+export HF_HOME="${WORKSPACE}/.cache/huggingface"
+export HUGGINGFACE_HUB_CACHE="${HF_HOME}"
+mkdir -p "$HF_HOME" "$LOG_DIR"
 
-dl_if_missing(){
-  local url="$1" out="$2"
-  if [[ -f "$out" ]]; then log "✔ vorhanden: $out"; return 0; fi
-  log "⬇ $out"
-  if [[ -n "${HF_TOKEN:-}" ]]; then
-    curl -L --fail --retry 5 --connect-timeout 15 -H "Authorization: Bearer $HF_TOKEN" "$url" -o "$out"
-  else
-    curl -L --fail --retry 5 --connect-timeout 15 "$url" -o "$out"
-  fi
-}
-
-clone_or_update(){
-  local url="$1" dir="$2"
-  if [[ ! -d "$dir/.git" ]]; then
-    log "⬇ $url → $dir"
-    git clone --depth=1 "$url" "$dir" || true
-  else
-    log "↻ pull $dir"
-    (cd "$dir" && git pull --ff-only || true)
-  fi
-}
-
-# ====== Custom Node: nur ControlNet-Aux (kein Advanced/InstantID) ======
-log "== 🧩 Custom Nodes: comfyui_controlnet_aux =="
-clone_or_update "https://github.com/Fannovel16/comfyui_controlnet_aux.git" "$CNODES/comfyui_controlnet_aux"
-if command -v pip >/dev/null 2>&1; then
-  pip install --no-cache-dir -r "$CNODES/comfyui_controlnet_aux/requirements.txt" >>"$LOG_DIR/pip.log" 2>&1 || true
+# ---- ComfyUI klonen (idempotent) ----
+if [[ ! -d "$COMFY_DIR/.git" ]]; then
+  log "Cloning ComfyUI …"
+  git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
+else
+  log "ComfyUI vorhanden – kein Clone."
 fi
 
-# ====== HF Bundle Sync (Workflows/Models/Web-Extensions) ======
-if [[ -n "${HF_REPO_ID:-}" ]]; then
-  if [[ "$HF_REQUIRE_TOKEN" = "1" && -z "${HF_TOKEN:-}" ]]; then
-    log "HF Sync übersprungen (HF_TOKEN fehlt & REQUIRE_TOKEN=1)"
-  else
-    python - <<'PY' || true
-import os
-from pathlib import Path
-from huggingface_hub import snapshot_download
+# ---- requirements.txt säubern (keine Beispiel-Workflows) ----
+if [[ -f "$COMFY_DIR/requirements.txt" ]] && grep -q "comfyui-workflow-templates" "$COMFY_DIR/requirements.txt"; then
+  log "Patch requirements.txt → entferne comfyui-workflow-templates"
+  sed -i '/comfyui-workflow-templates/d' "$COMFY_DIR/requirements.txt"
+fi
 
-repo = os.environ.get("HF_REPO_ID","")
-token = os.environ.get("HF_TOKEN") or None
-stage = Path(os.environ.get("HF_DIR","/workspace/hf_bundle"))
-stage.mkdir(parents=True, exist_ok=True)
-print("[HF] snapshot_download:", repo, "→", stage)
-
-snapshot_download(
-    repo_id=repo,
-    revision="main",
-    local_dir=str(stage),
-    token=token,
-    local_dir_use_symlinks=False
-)
-print("[HF] snapshot OK")
+# ---- Python-Requirements (best effort) ----
+log "Install Python packages …"
+python - <<'PY' || true
+import subprocess, sys, os
+# pip tooling + aktuelles huggingface_hub
+subprocess.run([sys.executable,"-m","pip","install","--no-cache-dir","--upgrade",
+                "pip","wheel","setuptools","huggingface_hub>=0.35.0"], check=False)
+req = os.path.join(os.environ.get("COMFY_DIR","/workspace/ComfyUI"), "requirements.txt")
+if os.path.exists(req):
+    subprocess.run([sys.executable,"-m","pip","install","--no-cache-dir","-r", req], check=False)
+# manche KSampler erwarten torchsde
+try:
+    import importlib; importlib.import_module("torchsde")
+except Exception:
+    subprocess.run([sys.executable,"-m","pip","install","--no-cache-dir","torchsde"], check=False)
 PY
-    # Kopieren in Comfy-Struktur
-    if [[ -d "$HF_DIR/models" ]]; then
-      copy_into "$HF_DIR/models" "$MODELS_DIR";      log "✔ Modelle synchronisiert"
-    fi
-    if [[ -d "$HF_DIR/workflows" ]]; then
-      copy_into "$HF_DIR/workflows" "$COMFY_DIR/user/default/workflows"; log "✔ Workflows synchronisiert"
-    fi
-    if [[ -d "$HF_DIR/web_extensions" ]]; then
-      copy_into "$HF_DIR/web_extensions" "$COMFY_DIR/web/extensions"; log "✔ Web-Extensions synchronisiert"
-    fi
+
+# ---- Zielordner in ComfyUI (idempotent) ----
+mkdir -p "$MODELS_DIR"/{checkpoints,loras,controlnet,upscale_models,faces,vae,clip_vision,style_models,embeddings,diffusers,vae_approx}
+mkdir -p "$COMFY_DIR/user/default/workflows" "$COMFY_DIR/custom_nodes" "$COMFY_DIR/web/extensions"
+
+# ---- Optionaler NSFW-Bypass (defensiv, no-op wenn Muster nicht existieren) ----
+if [[ "$NSFW_BYPASS" == "1" ]]; then
+  log "NSFW bypass aktiv."
+  set +e
+  mapfile -t _BN < <(grep -RIl --include="*.py" "block_nsfw" "$COMFY_DIR" 2>/dev/null || true)
+  [[ ${#_BN[@]} -gt 0 ]] && sed -i 's/block_nsfw[[:space:]]*:[[:space:]]*Optional\[bool\][[:space:]]*=[[:space:]]*None/block_nsfw: Optional[bool] = False/g' "${_BN[@]}" 2>/dev/null
+  [[ ${#_BN[@]} -gt 0 ]] && sed -i 's/block_nsfw=None/block_nsfw=False/g' "${_BN[@]}" 2>/dev/null
+  mapfile -t _SC < <(grep -RIl --include="*.py" "safety_checker[[:space:]]*=" "$COMFY_DIR" 2>/dev/null || true)
+  [[ ${#_SC[@]} -gt 0 ]] && sed -i 's/safety_checker[[:space:]]*=[[:space:]]*safety_checker/safety_checker=None/g' "${_SC[@]}" 2>/dev/null
+  set -e
+else
+  log "NSFW bypass deaktiviert (NSFW_BYPASS!=1)."
+fi
+
+# ==== HF Direct Download – pro Datei (robust & idempotent) ====
+download_all_from_hf() {
+  if [[ -z "${HF_REPO_ID}" || -z "${HF_TOKEN}" ]]; then
+    log "HF-Download übersprungen (HF_REPO_ID/HF_TOKEN fehlen)."
+    return
+  fi
+
+  python - <<'PY'
+import os, shutil
+from huggingface_hub import HfApi, hf_hub_download, login
+
+def human(n):
+    u=["B","KB","MB","GB","TB"]; i=0
+    while n>=1024 and i<len(u)-1: n/=1024; i+=1
+    return f"{n:.2f} {u[i]}"
+
+repo   = os.environ.get("HF_REPO_ID","")
+token  = os.environ.get("HF_TOKEN","")
+work   = os.environ.get("WORKSPACE","/workspace")
+comfy  = os.path.join(work,"ComfyUI")
+models = os.path.join(comfy,"models")
+login(token=token, add_to_git_credential=False)
+api = HfApi()
+
+MAP = {
+  "checkpoints":    os.path.join(models,"checkpoints"),
+  "loras":          os.path.join(models,"loras"),
+  "controlnet":     os.path.join(models,"controlnet"),
+  "upscale_models": os.path.join(models,"upscale_models"),
+  "faces":          os.path.join(models,"faces"),
+  "vae":            os.path.join(models,"vae"),
+}
+files = api.list_repo_files(repo_id=repo, repo_type="model")
+print(f"[INFO] Dateien im Repo: {len(files)}")
+
+cache = "/tmp/hf_cache_full"; os.makedirs(cache, exist_ok=True)
+total_bytes = 0; m_cnt = 0; w_cnt = 0
+
+def copy_to(dst, src):
+    os.makedirs(dst, exist_ok=True)
+    out = os.path.join(dst, os.path.basename(src))
+    if os.path.exists(out) and os.path.getsize(out) == os.path.getsize(src):
+        print(f"[SKIP] {os.path.basename(src)}")
+        return 0
+    shutil.copy2(src, out)
+    return os.path.getsize(out)
+
+# Modelle
+for f in files:
+    sub = f.split("/",1)[0] if "/" in f else ""
+    if sub in MAP and not f.endswith("/"):
+        try:
+            p = hf_hub_download(repo_id=repo, filename=f, repo_type="model",
+                                local_dir=cache, local_dir_use_symlinks=False)
+            total_bytes += copy_to(MAP[sub], p); m_cnt += 1
+            print(f"[OK]  {f}")
+        except Exception as e:
+            print(f"[ERR] {f} -> {e}")
+
+# Workflows
+w_dst = os.path.join(comfy,"user","default","workflows")
+os.makedirs(w_dst, exist_ok=True)
+for f in files:
+    if f.startswith("workflows/") and f.lower().endswith(".json"):
+        try:
+            p = hf_hub_download(repo_id=repo, filename=f, repo_type="model",
+                                local_dir=cache, local_dir_use_symlinks=False)
+            total_bytes += copy_to(w_dst, p); w_cnt += 1
+            print(f"[WF]  {f}")
+        except Exception as e:
+            print(f"[ERR] {f} -> {e}")
+
+print(f"[SUMMARY] Geladen: {m_cnt} Modelle, {w_cnt} Workflows, Gesamt: {human(total_bytes)}")
+PY
+}
+
+# Laden (falls Token & Repo gesetzt)
+download_all_from_hf
+
+# Web-Extensions VOR dem Exec aktualisieren
+if [[ -n "${HF_REPO_ID}" && -n "${HF_TOKEN}" ]]; then
+  log "Aktualisiere web_extensions …"
+  python - <<'PY' || true
+import os, shutil
+from huggingface_hub import HfApi, hf_hub_download, login
+repo=os.environ.get("HF_REPO_ID","")
+token=os.environ.get("HF_TOKEN","")
+base=os.environ.get("WORKSPACE","/workspace")
+dst=os.path.join(base,"ComfyUI","web","extensions")
+os.makedirs(dst, exist_ok=True)
+login(token=token, add_to_git_credential=False)
+api=HfApi()
+files=api.list_repo_files(repo_id=repo, repo_type="model")
+cache="/tmp/hf_cache_webext"; os.makedirs(cache, exist_ok=True)
+n=0
+for f in files:
+    if f.startswith("web_extensions/") and not f.endswith("/"):
+        p=hf_hub_download(repo_id=repo, filename=f, repo_type="model",
+                          local_dir=cache, local_dir_use_symlinks=False)
+        rel=f.split("/",1)[1]
+        out=os.path.join(dst, rel)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        if not os.path.exists(out) or os.path.getsize(out)!=os.path.getsize(p):
+            shutil.copy2(p,out); n+=1
+print(f"[entrypoint] web_extensions aktualisiert: {n} Dateien")
+PY
+else
+  log "web_extensions: skip (HF_REPO_ID/HF_TOKEN fehlen)."
+fi
+
+# ---- Services starten ----
+# Jupyter zuerst (optional, Hintergrund)
+if [[ "${RUN_JUPYTER}" == "1" ]]; then
+  log "Starte JupyterLab auf :${JUPYTER_PORT}"
+  if [[ -n "$JUPYTER_TOKEN" ]]; then
+    jupyter lab --ip=0.0.0.0 --port="$JUPYTER_PORT" --no-browser --allow-root \
+      --ServerApp.token="$JUPYTER_TOKEN" --ServerApp.open_browser=False >"$LOG_DIR/jupyter.log" 2>&1 &
+  else
+    jupyter lab --ip=0.0.0.0 --port="$JUPYTER_PORT" --no-browser --allow-root \
+      --ServerApp.token="" --ServerApp.password="" --ServerApp.open_browser=False >"$LOG_DIR/jupyter.log" 2>&1 &
   fi
 else
-  log "HF_REPO_ID nicht gesetzt → kein HF Sync"
+  log "RUN_JUPYTER=0 – Jupyter deaktiviert."
 fi
 
-# ====== Annotator-CKPT Symlinks für controlnet_aux ======
-# 1) Zielpfade, die von controlnet_aux erwartet werden
-AUX1="$CNODES/comfyui_controlnet_aux/ckpts"
-AUX2="$CNODES/comfyui_controlnet_aux/annotator/ckpts"
-mkdir -p "$(dirname "$AUX1")" "$(dirname "$AUX2")"
-ln -sf "$CKPTS" "$AUX1" || true
-ln -sf "$CKPTS" "$AUX2" || true
-
-# ====== OpenPose/DWPose: nur Fallback-Download, falls HF-Bundle nichts geliefert hat ======
-need_any=0
-for f in \
-  "$CKPTS/body_pose_model.pth" \
-  "$CKPTS/hand_pose_model.pth" \
-  "$CKPTS/facenet.pth" \
-  "$CKPTS/dw-ll_ucoco_384.pth" \
-  "$CKPTS/yolox_l.onnx" \
-  "$CKPTS/yolox_l.torchscript"
-do
-  [[ -f "$f" ]] || need_any=1
-done
-
-if [[ $need_any -eq 1 ]]; then
-  log "== 🧠 OpenPose/DWPose Fallback-Downloads =="
-  dl_if_missing "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/ckpts/body_pose_model.pth" "$CKPTS/body_pose_model.pth" || true
-  dl_if_missing "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/ckpts/hand_pose_model.pth" "$CKPTS/hand_pose_model.pth" || true
-  # facenet ist optional; wenn 404/privat → ignorieren
-  dl_if_missing "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/ckpts/facenet.pth" "$CKPTS/facenet.pth" || true
-  dl_if_missing "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.pth" "$CKPTS/dw-ll_ucoco_384.pth" || true
-  dl_if_missing "https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx"        "$CKPTS/yolox_l.onnx" || true
-  # torchscript ist optional – wenn privat/404, egal
-  dl_if_missing "https://huggingface.co/monster-labs/controlnet_aux_models/resolve/main/yolox_l.torchscript" "$CKPTS/yolox_l.torchscript" || true
-fi
-
-# ====== Optional: Jupyter ======
-if [[ "${JUPYTER_ENABLE}" == "1" ]]; then
-  log "== 🧪 Starte JupyterLab (Port ${JUPYTER_PORT}) =="
-  nohup jupyter-lab --ip=0.0.0.0 --port="$JUPYTER_PORT" --no-browser >"$LOG_DIR/jupyter.log" 2>&1 &
-fi
-
-# ====== Sanity Log: NSFW-Patch ======
-python - <<'PY' || true
-try:
-    from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
-    print("[NSFW] SafetyChecker:", StableDiffusionSafetyChecker.__name__)
-except Exception as e:
-    print("[NSFW] diffusers Checker nicht importierbar (ok falls nicht genutzt):", e)
-PY
-
-# ====== Start ComfyUI ======
+# ComfyUI im Vordergrund (saubere PID via exec)
+log "Starte ComfyUI auf :${COMFYUI_PORT}"
 cd "$COMFY_DIR"
-log "== 🚀 Starte ComfyUI (Port ${COMFYUI_PORT}) =="
-exec python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >>"$LOG_DIR/comfyui.log" 2>&1
+exec python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >"$LOG_DIR/comfyui.log" 2>&1
