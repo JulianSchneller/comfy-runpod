@@ -1,3 +1,4 @@
+\
 #!/bin/sh
 set -eu
 
@@ -74,6 +75,11 @@ CSS
   say "[entrypoint] NSFW bypass CSS gesetzt."
 fi
 
+# ---------- Ensure huggingface_hub before using it ----------
+if [ "${ENTRYPOINT_DRY}" != "1" ] && [ "${HF_SYNC}" = "1" ]; then
+  python3 -m pip install -q --no-cache-dir "huggingface_hub>=0.35.0" || true
+fi
+
 # ---------- Hugging Face snapshot (optional) ----------
 STAGE="${WORKSPACE}/.hf_stage"
 if [ "${ENTRYPOINT_DRY}" = "1" ]; then
@@ -83,7 +89,11 @@ else
     mkdir -p "${STAGE}"
     python3 - "$@" <<'PY'
 import os, sys
-from huggingface_hub import snapshot_download
+try:
+    from huggingface_hub import snapshot_download
+except Exception as e:
+    print("[entrypoint] [HF] WARN: huggingface_hub fehlt oder ist defekt:", e)
+    sys.exit(0)
 
 repo_id = os.environ.get("HF_REPO_ID", "")
 revision = os.environ.get("HF_BRANCH", "main")
@@ -97,7 +107,6 @@ try:
         revision=revision,
         local_dir=local_dir,
         local_dir_use_symlinks=False,
-        allow_patterns=None,
         token=token,
         repo_type="model",
     )
@@ -139,10 +148,10 @@ if [ ! -e "${COMFYUI_BASE}/custom_nodes/comfyui_controlnet_aux" ]; then
 fi
 
 # ---------- controlnet_aux: dependencies ----------
-python3 -m pip install --no-warn-script-location -U opencv-python onnx onnxruntime >/dev/null 2>&1 || true
+python3 -m pip install -q --no-warn-script-location -U opencv-python onnx onnxruntime || true
 REQ="${AUX_DIR}/requirements.txt"
 if [ -f "${REQ}" ]; then
-  python3 -m pip install --no-warn-script-location -r "${REQ}" >/dev/null 2>&1 || true
+  python3 -m pip install -q --no-warn-script-location -r "${REQ}" || true
 fi
 
 # ---------- Models (OpenPose & DWPose) ----------
@@ -185,7 +194,7 @@ fi
 
 # ---------- Normalize workflows (old → new class names) ----------
 python3 - "$@" <<'PY'
-import os, re, json, sys
+import os, re, sys
 def walk_jsons(base):
     if not os.path.isdir(base): return
     for r,_,fs in os.walk(base):
@@ -196,9 +205,9 @@ def walk_jsons(base):
 bases = []
 for k in ("WORKSPACE", "COMFYUI_BASE"):
     v = os.environ.get(k)
-    if v: bases.append(os.path.join(v, "workflows"))
-for b in set(bases):
-    pass
+    if v:
+        wf = os.path.join(v, "workflows")
+        if os.path.isdir(wf): bases.append(wf)
 
 REPL = {
     r'"controlnet_aux\.OpenposePreprocessor"': '"controlnet_aux.OpenPosePreprocessor"',
