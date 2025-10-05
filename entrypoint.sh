@@ -303,7 +303,25 @@ fi
 
 echo "[entrypoint] controlnet_aux: OK."
 # ==== ControlNet-Aux: END ====
-exec python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >"$LOG_DIR/comfyui.log" 2>&1
+exec # === controlnet_aux workflow patch ===
+if [ -z "${WF_DIR:-}" ]; then
+  # Standard-Workflows im Bundle (RunPod/Container legt ${
+  # WORKSPACE} vorher; ENTRYPOINT setzt WF_DIR meist auf /workspace/workflows)
+  WF_DIR="${WORKSPACE:-/workspace}/workflows"
+fi
+
+if [ -d "${WF_DIR}" ]; then
+  echo "[entrypoint] controlnet_aux: patch workflows in $WF_DIR …"
+  # Ersetze ALLE bekannten Schreibweisen -> aktuelle Klassen
+  grep -RIl 'controlnet_aux\.Open[Pp]osePreprocessor\|controlnet_aux\.[Dd][Ww]posePreprocessor' "$WF_DIR" 2>/dev/null \
+  | xargs -r sed -i \
+      -e 's/controlnet_aux\.Open[Pp]osePreprocessor/controlnet_aux.OpenposePreprocessor/g' \
+      -e 's/controlnet_aux\.[Dd][Ww]posePreprocessor/controlnet_aux.DWposePreprocessor/g'
+else
+  echo "[entrypoint] Hinweis: WF_DIR '$WF_DIR' nicht gefunden (patch übersprungen)."
+fi
+# === end controlnet_aux workflow patch ===
+python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >"$LOG_DIR/comfyui.log" 2>&1
 
 
 
