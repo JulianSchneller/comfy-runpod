@@ -321,6 +321,22 @@ else
   echo "[entrypoint] Hinweis: WF_DIR '$WF_DIR' nicht gefunden (patch übersprungen)."
 fi
 # === end controlnet_aux workflow patch ===
+# --- Patch controlnet_aux Workflows (OpenPose/DWPose) ---
+{
+  PY="/workspace/ComfyUI/cn_aux_patch.py"
+  # Script an den tatsächlichen ComfyUI-Root kopieren
+  for base in "/workspace/ComfyUI" "/ComfyUI" "/content/ComfyUI"; do
+    if [ -d "$base" ]; then
+      cp -f "/workspace/scripts/cn_aux_patch.py" "$base/cn_aux_patch.py" 2>/dev/null || true
+      PY="$base/cn_aux_patch.py"
+      break
+    fi
+  done
+  if command -v python3 >/dev/null 2>&1 && [ -f "$PY" ]; then
+    echo "[entrypoint] Patch controlnet_aux Workflows …"
+    python3 "$PY" || true
+  fi
+}
 python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >"$LOG_DIR/comfyui.log" 2>&1
 
 # >>> controlnet_aux setup (auto)
