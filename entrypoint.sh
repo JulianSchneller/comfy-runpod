@@ -323,6 +323,38 @@ fi
 # === end controlnet_aux workflow patch ===
 python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >"$LOG_DIR/comfyui.log" 2>&1
 
+# >>> controlnet_aux setup (auto)
+# Klone/Aktualisiere comfyui_controlnet_aux (OpenPose, DWPose, u.a.) und installiere Requirements.
+# Idempotent: nur ausführen, wenn ComfyUI-Base existiert.
+COMFYUI_BASE="${COMFYUI_BASE:-}"
+if [ -z "${COMFYUI_BASE}" ]; then
+  if   [ -d "/workspace/ComfyUI" ]; then COMFYUI_BASE="/workspace/ComfyUI";
+  elif [ -d "/ComfyUI" ];          then COMFYUI_BASE="/ComfyUI";
+  else echo "[entrypoint] WARN: COMFYUI_BASE nicht gefunden (skip controlnet_aux setup)"; 
+       COMFYUI_BASE=""; 
+  fi
+fi
 
+if [ -n "${COMFYUI_BASE}" ] && [ -d "${COMFYUI_BASE}/custom_nodes" ]; then
+  AUX_DIR="${COMFYUI_BASE}/custom_nodes/comfyui_controlnet_aux"
+  if [ ! -d "${AUX_DIR}" ]; then
+    echo "[entrypoint] Clone comfyui_controlnet_aux …"
+    git clone --depth=1 https://github.com/Fannovel16/comfyui_controlnet_aux "${AUX_DIR}" || true
+  else
+    echo "[entrypoint] Update comfyui_controlnet_aux …"
+    (cd "${AUX_DIR}" && git pull --rebase || true)
+  fi
 
+  if [ -f "${AUX_DIR}/requirements.txt" ]; then
+    echo "[entrypoint] Install comfyui_controlnet_aux requirements …"
+    pip install --no-cache-dir -r "${AUX_DIR}/requirements.txt" || true
+  fi
 
+  # (Optional) Bekannte Zusatz-Weights-Ordner vorbereiten (stört nicht, wenn leer/unused)
+  mkdir -p "${COMFYUI_BASE}/models/controlnet"            "${COMFYUI_BASE}/models/annotators/ckpts"            "${COMFYUI_BASE}/models/loras" || true
+
+  echo "[entrypoint] controlnet_aux bereit."
+else
+  echo "[entrypoint] Skip controlnet_aux (ComfyUI-Base nicht gefunden)."
+fi
+# <<< controlnet_aux setup (auto)
