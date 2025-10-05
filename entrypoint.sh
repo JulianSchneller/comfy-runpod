@@ -557,3 +557,119 @@ PY
 fi
 # === controlnet_aux Pose Fix END ===
 
+# --- BEGIN controlnet_aux (OpenPose/DWPose) setup ---
+# Basispfade sicher setzen
+: "${WORKSPACE:=/workspace}"
+: "${COMFYUI_BASE:=${WORKSPACE}/ComfyUI}"
+: "${COMFYUI_MODELS:=${WORKSPACE}/models}"
+
+CN_DIR="${COMFYUI_BASE}/custom_nodes/comfyui_controlnet_aux"
+
+# Node bereitstellen (git-clone falls fehlt)
+if [ ! -d "${CN_DIR}" ]; then
+  echo "[entrypoint] Install 'comfyui_controlnet_aux' …"
+  git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux "${CN_DIR}" || true
+else
+  if [ -d "${CN_DIR}/.git" ]; then
+    echo "[entrypoint] Update 'comfyui_controlnet_aux' …"
+    git -C "${CN_DIR}" pull --ff-only || true
+  fi
+fi
+
+# Python-Dependencies (für Pose)
+echo "[entrypoint] Install Pose-Dependencies (opencv, onnxruntime, onnx) …"
+python3 -m pip install -U --no-cache-dir opencv-python onnxruntime onnx >/dev/null 2>&1 || true
+if [ -f "${CN_DIR}/requirements.txt" ]; then
+  python3 -m pip install -r "${CN_DIR}/requirements.txt" >/dev/null 2>&1 || true
+fi
+
+# Modelle (OpenPose + DWPose)
+AUX_MODELS_NODE="${CN_DIR}/models"
+AUX_MODELS_COMFY="${COMFYUI_MODELS}/controlnet-aux"
+mkdir -p "${AUX_MODELS_NODE}" "${AUX_MODELS_COMFY}"
+
+fetch() {
+  url="$1"; out="$2";
+  if [ ! -s "$out" ]; then
+    echo "[entrypoint] dl $(basename "$out")"
+    curl -L --retry 3 -o "$out" "$url" >/dev/null 2>&1 || wget -q -O "$out" "$url" || true
+  fi
+}
+
+# OpenPose
+fetch "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/openpose/body_pose_model.pth" "${AUX_MODELS_NODE}/body_pose_model.pth"
+fetch "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/openpose/hand_pose_model.pth" "${AUX_MODELS_NODE}/hand_pose_model.pth"
+fetch "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/openpose/face_pose_model.pth" "${AUX_MODELS_NODE}/face_pose_model.pth"
+
+# DWPose (ONNX)
+fetch "https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx" "${AUX_MODELS_NODE}/yolox_l.onnx"
+fetch "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.onnx" "${AUX_MODELS_NODE}/dw-ll_ucoco_384.onnx"
+
+# in ComfyUI/models/controlnet-aux spiegeln (ohne Überschreiben)
+for f in body_pose_model.pth hand_pose_model.pth face_pose_model.pth yolox_l.onnx dw-ll_ucoco_384.onnx; do
+  if [ -s "${AUX_MODELS_NODE}/$f" ] && [ ! -s "${AUX_MODELS_COMFY}/$f" ]; then
+    cp -n "${AUX_MODELS_NODE}/$f" "${AUX_MODELS_COMFY}/$f" || true
+  fi
+done
+
+# Alias-Patch (Legacy-Klassennamen)
+NW_INIT="${CN_DIR}/node_wrappers/__init__.py"
+if [ -f "${NW_INIT}" ] && ! grep -q "BEGIN comfy-runpod legacy alias patch" "${NW_INIT}"; then
+  cat >> "${NW_INIT}" <<'PY'
+# --- BEGIN comfy-runpod legacy alias patch ---
+try:
+    _m = NODE_CLASS_MAPPINGS
+    def _alias(dst, src):
+        if (src in _m) and (dst not in _m):
+            _m[dst] = _m[src]
+    _alias("OpenposePreprocessor", "OpenPosePreprocessor")
+    _alias("OpenposeDetector",     "OpenPoseDetector")
+    _alias("DWposePreprocessor",   "DWPosePreprocessor")
+    _alias("DWposeDetector",       "DWPoseDetector")
+except Exception as _e:
+    print("[controlnet_aux] alias patch warn:", _e)
+# --- END comfy-runpod legacy alias patch ---
+PY
+fi
+
+# --- Workflow-Normalizer ---
+# Korrigiert alte Node-Namen in *.json Workflows vor dem Start.
+# Sucht unter: /workspace/workflows und ${COMFYUI_BASE}/workflows (falls vorhanden).
+WF_DIRS=""
+[ -d "/workspace/workflows" ] && WF_DIRS="$WF_DIRS /workspace/workflows"
+[ -d "${COMFYUI_BASE}/workflows" ] && WF_DIRS="$WF_DIRS ${COMFYUI_BASE}/workflows"
+
+if [ -n "${WF_DIRS}" ]; then
+  echo "[entrypoint] Normalize workflows (Openpose/DWpose → OpenPose/DWPose) …"
+  python3 - <<'PY2'
+import os, re, json, sys, glob
+dirs = sys.argv[1:]
+repls = [
+    (r'"controlnet_aux\.OpenposePreprocessor"', '"controlnet_aux.OpenPosePreprocessor"'),
+    (r'"controlnet_aux\.OpenposeDetector"',     '"controlnet_aux.OpenPoseDetector"'),
+    (r'"controlnet_aux\.DWposePreprocessor"',   '"controlnet_aux.DWPosePreprocessor"'),
+    (r'"controlnet_aux\.DWposeDetector"',       '"controlnet_aux.DWPoseDetector"'),
+]
+changed = 0
+seen = set()
+for base in dirs:
+    if not os.path.isdir(base): continue
+    for root, _, files in os.walk(base):
+        for fn in files:
+            if not fn.lower().endswith(".json"): continue
+            p = os.path.join(root, fn)
+            try:
+                s = open(p, "r", encoding="utf-8").read()
+                s2 = s
+                for pat, rep in repls:
+                    s2 = re.sub(pat, rep, s2)
+                if s2 != s:
+                    open(p, "w", encoding="utf-8").write(s2)
+                    changed += 1
+            except Exception as e:
+                print("[workflow-normalizer] warn:", p, e)
+print(f"[workflow-normalizer] fixed={changed}")
+PY2
+  ${WF_DIRS}
+fi
+# --- END controlnet_aux (OpenPose/DWPose) setup ---
