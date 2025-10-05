@@ -227,3 +227,47 @@ if [ "${ENABLE_JUPYTER}" = "1" ]; then
 fi
 
 wait
+
+# >>> CN_AUX_BEGIN
+# robustes Setup für controlnet_aux (Node + Modelle) – unabhängig vom HF-Sync
+AUX_DIR="${WORKSPACE:-/workspace}/custom_nodes/comfyui_controlnet_aux"
+mkdir -p "$(dirname "$AUX_DIR")"
+
+if [ ! -d "$AUX_DIR" ]; then
+  echo "[entrypoint] Install controlnet_aux Node (ZIP)…"
+  TMP_ZIP="/tmp/cn_aux.zip"
+  (command -v curl >/dev/null 2>&1 && curl -L -o "$TMP_ZIP" "https://codeload.github.com/Fannovel16/comfyui_controlnet_aux/zip/refs/heads/main") ||   (command -v wget >/dev/null 2>&1 && wget -O "$TMP_ZIP" "https://codeload.github.com/Fannovel16/comfyui_controlnet_aux/zip/refs/heads/main") || true
+  if [ -s "$TMP_ZIP" ]; then
+    rm -rf /tmp/cn_aux && mkdir -p /tmp/cn_aux
+    unzip -q "$TMP_ZIP" -d /tmp/cn_aux || true
+    SRC_DIR="$(find /tmp/cn_aux -maxdepth 1 -type d -name 'comfyui_controlnet_aux-*' | head -n1)"
+    if [ -n "$SRC_DIR" ]; then
+      mv "$SRC_DIR" "$AUX_DIR"
+    fi
+  fi
+fi
+
+# Sicherheitsnetz: falls AUX_DIR weiterhin fehlt, nicht abbrechen – Rest kann laufen
+if [ ! -d "$AUX_DIR" ]; then
+  echo "[entrypoint] WARN: controlnet_aux konnte nicht installiert werden."
+else
+  # Modelle sicherstellen
+  AUX_MODELS="$AUX_DIR/models"
+  mkdir -p "$AUX_MODELS"
+  dl() { u="$1"; f="$2"; if [ ! -s "$AUX_MODELS/$f" ]; then echo "[entrypoint] ↓ $f"; (curl -L -o "$AUX_MODELS/$f" "$u" || wget -O "$AUX_MODELS/$f" "$u" || true); fi; }
+  dl "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/openpose/body_pose_model.pth" "body_pose_model.pth"
+  dl "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/openpose/hand_pose_model.pth" "hand_pose_model.pth"
+  dl "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/openpose/face_pose_model.pth" "face_pose_model.pth"
+  dl "https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx" "yolox_l.onnx"
+  dl "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.onnx" "dw-ll_ucoco_384.onnx"
+  dl "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.pth"  "dw-ll_ucoco_384.pth"
+
+  # In ComfyUI sichtbar machen (Symlink bevorzugt, Copy Fallback)
+  CBASE="${COMFYUI_BASE:-/workspace/ComfyUI}"
+  mkdir -p "$CBASE/custom_nodes"
+  if [ ! -e "$CBASE/custom_nodes/comfyui_controlnet_aux" ]; then
+    ln -s "$AUX_DIR" "$CBASE/custom_nodes/comfyui_controlnet_aux" 2>/dev/null || cp -r "$AUX_DIR" "$CBASE/custom_nodes/"
+  fi
+fi
+# <<< CN_AUX_END
+
