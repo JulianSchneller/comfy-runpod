@@ -202,9 +202,7 @@ fi
 # ComfyUI im Vordergrund (saubere PID via exec)
 log "Starte ComfyUI auf :${COMFYUI_PORT}"
 cd "$COMFY_DIR"
-exec python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >"$LOG_DIR/comfyui.log" 2>&1
-
-# ==== ControlNet-Aux: BEGIN ====
+# ==== ControlNet-Aux: BEGIN (install & ckpts & workflow patch) ====
 set -e
 
 : "${WORKSPACE:=/workspace}"
@@ -215,7 +213,7 @@ AUX_DIR="${CUSTOM_NODES}/comfyui_controlnet_aux"
 CKPT_DIR="${WORKSPACE}/annotators/ckpts"
 ALT_CKPT_DIR_A="${WORKSPACE}/annotators/models"
 ALT_CKPT_DIR_B="${WORKSPACE}/models/annotators/ckpts"
-WF_DIR="${WORKSPACE}/workflows"
+WF_DIR="${COMFYUI_BASE}/user/default/workflows"
 
 echo "[entrypoint] controlnet_aux: setup…"
 mkdir -p "${CUSTOM_NODES}"
@@ -228,14 +226,18 @@ else
   git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux.git "${AUX_DIR}"
 fi
 
-# CPU/GPU ONNXRuntime wählen (optional via CONTROLNET_AUX_USE_GPU=1)
+# Requirements
+if [ -f "${AUX_DIR}/requirements.txt" ]; then
+  python3 -m pip install --no-cache-dir -r "${AUX_DIR}/requirements.txt" || true
+fi
+# ONNXRuntime CPU/GPU (optional via CONTROLNET_AUX_USE_GPU=1)
 if [ "${CONTROLNET_AUX_USE_GPU:-0}" = "1" ]; then
-  pip install -q --no-cache-dir onnxruntime-gpu==1.18.1 opencv-python==4.10.0.84 numpy einops timm
+  python3 -m pip install --no-cache-dir onnxruntime-gpu==1.18.1 opencv-python==4.10.0.84 numpy einops timm || true
 else
-  pip install -q --no-cache-dir onnxruntime==1.18.1       opencv-python==4.10.0.84 numpy einops timm
+  python3 -m pip install --no-cache-dir onnxruntime==1.18.1       opencv-python==4.10.0.84 numpy einops timm || true
 fi
 
-# Annotator-CKPTs finden oder verlinken
+# CKPT-Verlinkung
 if [ ! -d "${CKPT_DIR}" ]; then
   if   [ -d "${ALT_CKPT_DIR_A}" ]; then
     mkdir -p "$(dirname "${CKPT_DIR}")"; ln -s "${ALT_CKPT_DIR_A}" "${CKPT_DIR}" 2>/dev/null || true
@@ -251,7 +253,7 @@ if [ -d "${CKPT_DIR}" ]; then
   (ls -1 "${CKPT_DIR}" 2>/dev/null || true) | sed 's/^/  - /'
 fi
 
-# Workflows komp. patchen (Node-Klassennamen-Änderungen)
+# Workflows patchen: neue Klassennamen
 if [ -d "${WF_DIR}" ]; then
   echo "[entrypoint] controlnet_aux: patch workflows in ${WF_DIR}…"
   grep -RIl 'controlnet_aux\.OpenPosePreprocessor\|controlnet_aux\.DwposePreprocessor' "${WF_DIR}" 2>/dev/null \
@@ -262,50 +264,9 @@ fi
 
 echo "[entrypoint] controlnet_aux: OK."
 # ==== ControlNet-Aux: END ====
+exec python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >"$LOG_DIR/comfyui.log" 2>&1
 
-# >>> controlnet_aux install block >>>
-# Idempotent: installiert comfyui_controlnet_aux und richtet CKPT-Pfade ein
-set -eu
 
-COMFYUI_BASE="${COMFYUI_BASE:-/workspace/ComfyUI}"
-WORKSPACE="${WORKSPACE:-/workspace}"
 
-CN_DIR="${COMFYUI_BASE}/custom_nodes/comfyui_controlnet_aux"
-if [ ! -d "${CN_DIR}" ]; then
-  echo "[entrypoint] Install comfyui_controlnet_aux …"
-  mkdir -p "${COMFYUI_BASE}/custom_nodes"
-  if git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux "${CN_DIR}"; then
-    echo "[entrypoint] comfyui_controlnet_aux geklont."
-  else
-    echo "[entrypoint] FATAL: Clone comfyui_controlnet_aux fehlgeschlagen."; exit 1
-  fi
-  if [ -f "${CN_DIR}/requirements.txt" ]; then
-    python3 -m pip install --no-cache-dir -r "${CN_DIR}/requirements.txt" || true
-  fi
-fi
 
-AUX_SRC="${WORKSPACE}/annotators/ckpts"
-AUX_MODELS_DIR="${COMFYUI_BASE}/models/annotators"
-AUX_DST="${AUX_MODELS_DIR}/ckpts"
-ALT_ANN_DIR="${COMFYUI_BASE}/annotators"
-
-mkdir -p "${AUX_MODELS_DIR}"
-
-if [ ! -d "${AUX_SRC}" ]; then
-  echo "[entrypoint] WARN: ${AUX_SRC} nicht gefunden (kommt i.d.R. durch HF-Sync)."
-fi
-
-if [ -d "${AUX_SRC}" ] && [ ! -e "${AUX_DST}" ]; then
-  ln -s "${AUX_SRC}" "${AUX_DST}"
-  echo "[entrypoint] Symlink gesetzt: ${AUX_DST} → ${AUX_SRC}"
-fi
-
-if [ -d "${AUX_SRC}" ] && [ ! -e "${ALT_ANN_DIR}/ckpts" ]; then
-  mkdir -p "${ALT_ANN_DIR}"
-  ln -s "${AUX_SRC}" "${ALT_ANN_DIR}/ckpts"
-  echo "[entrypoint] Symlink gesetzt: ${ALT_ANN_DIR}/ckpts → ${AUX_SRC}"
-fi
-
-echo "[entrypoint] controlnet_aux bereit."
-# <<< controlnet_aux install block <<<
 
