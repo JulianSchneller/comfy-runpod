@@ -162,6 +162,45 @@ from huggingface_hub import HfApi, hf_hub_download, login
 repo=os.environ.get("HF_REPO_ID","")
 token=os.environ.get("HF_TOKEN","")
 base=os.environ.get("WORKSPACE","/workspace")
+
+# --- controlnet_aux setup START ---
+# Stelle sicher, dass COMFYUI_BASE und WORKSPACE gesetzt sind
+: "${WORKSPACE:=/workspace}"
+if [ -z "${COMFYUI_BASE:-}" ]; then
+  if   [ -d "/workspace/ComfyUI" ]; then COMFYUI_BASE="/workspace/ComfyUI";
+  elif [ -d "/opt/ComfyUI" ];      then COMFYUI_BASE="/opt/ComfyUI";
+  elif [ -d "/content/ComfyUI" ];  then COMFYUI_BASE="/content/ComfyUI";
+  else COMFYUI_BASE="/workspace/ComfyUI"; fi
+fi
+mkdir -p "${COMFYUI_BASE}/custom_nodes"
+
+# controlnet_aux klonen/prüfen (idempotent)
+AUX_DIR="${COMFYUI_BASE}/custom_nodes/comfyui_controlnet_aux"
+if [ -d "${AUX_DIR}/.git" ]; then
+  echo "[entrypoint] controlnet_aux: found (git)."
+elif [ -d "${AUX_DIR}" ]; then
+  echo "[entrypoint] controlnet_aux: exists (no git)."
+else
+  echo "[entrypoint] cloning controlnet_aux…"
+  git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux.git "${AUX_DIR}" || true
+fi
+
+# Optional: DWPose/OpenPose CKPTs von HF-Layout verlinken (idempotent)
+AUX_CKPTS_SRC="${WORKSPACE}/annotators/ckpts"
+AUX_CKPTS_DST="${WORKSPACE}/models/annotators/ckpts"
+if [ -d "${AUX_CKPTS_SRC}" ]; then
+  mkdir -p "$(dirname "${AUX_CKPTS_DST}")"
+  if [ ! -e "${AUX_CKPTS_DST}" ]; then
+    ln -s "${AUX_CKPTS_SRC}" "${AUX_CKPTS_DST}" || true
+    echo "[entrypoint] controlnet_aux: linked ckpts → ${AUX_CKPTS_SRC}"
+  else
+    echo "[entrypoint] controlnet_aux: ckpts-Link existiert."
+  fi
+else
+  echo "[entrypoint] WARN: ckpts-Quelle fehlt: ${AUX_CKPTS_SRC} (optional)"
+fi
+# --- controlnet_aux setup END ---
+
 dst=os.path.join(base,"ComfyUI","web","extensions")
 os.makedirs(dst, exist_ok=True)
 login(token=token, add_to_git_credential=False)
@@ -265,7 +304,6 @@ fi
 echo "[entrypoint] controlnet_aux: OK."
 # ==== ControlNet-Aux: END ====
 exec python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" >"$LOG_DIR/comfyui.log" 2>&1
-
 
 
 
