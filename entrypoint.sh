@@ -1,119 +1,163 @@
 #!/bin/sh
 set -eu
 
+say(){ printf "%b\n" "$*"; }
+
 # ---------- ENV Defaults ----------
 : "${WORKSPACE:=/workspace}"
-: "${COMFYUI_BASE:=}"
-: "${HF_REPO_ID:=}"          # z.B. Floorius/comfyui-model-bundle
+: "${COMFYUI_BASE:=}"                          # auto-detect unten
+: "${HF_REPO_ID:=Floorius/comfyui-model-bundle}"
 : "${HF_BRANCH:=main}"
-: "${HF_SYNC:=1}"            # 1 = HF-Bundle ziehen (wenn Token da), 0 = skip
-: "${HF_DELETE_EXTRAS:=0}"   # 1 = rsync --delete beim Spiegeln
-: "${ENTRYPOINT_DRY:=0}"     # 1 = keine Netz-Downloads (Test)
+: "${HF_SYNC:=1}"                              # 1 = HF ziehen
+: "${HF_DELETE_EXTRAS:=0}"                     # 1 = löschen mit rsync --delete
+: "${ENTRYPOINT_DRY:=0}"                       # 1 = Dry-Run: kein Netz
 : "${COMFYUI_PORT:=8188}"
+: "${ENABLE_JUPYTER:=0}"
+: "${JUPYTER_PORT:=8888}"
 
-# HF Token Varianten akzeptieren
+# HF Token (optional). Greife auf alternative Variablen zurück
 [ -n "${HF_TOKEN:-}" ] || HF_TOKEN="${HUGGINGFACE_HUB_TOKEN:-}"
 
-# ---------- ComfyUI-Basis finden ----------
+# ---------- ComfyUI Basis finden ----------
 if [ -z "${COMFYUI_BASE}" ]; then
-  for d in "${WORKSPACE}/ComfyUI" "/opt/ComfyUI" "/workspace/ComfyUI" "/content/ComfyUI" "/ComfyUI"; do
+  for d in "/workspace/ComfyUI" "/root/ComfyUI" "/opt/ComfyUI" "/content/ComfyUI"; do
     if [ -d "$d" ]; then COMFYUI_BASE="$d"; break; fi
   done
+  [ -n "${COMFYUI_BASE}" ] || COMFYUI_BASE="/content/ComfyUI"
 fi
-if [ -z "${COMFYUI_BASE}" ]; then
-  echo "[entrypoint] ❌ ComfyUI Basis nicht gefunden."; exit 1
-fi
-echo "[entrypoint] ComfyUI Base: ${COMFYUI_BASE}"
-mkdir -p "${WORKSPACE}" \
-         "${COMFYUI_BASE}/custom_nodes" \
-         "${COMFYUI_BASE}/models" \
-         "${COMFYUI_BASE}/workflows"
+say "[entrypoint] ComfyUI Base: ${COMFYUI_BASE}"
 
-# ---------- (Optional) HF-Bundle spiegeln ----------
-STAGE="${WORKSPACE}/hf_stage"
-if [ "${HF_SYNC}" = "1" ] && [ -n "${HF_REPO_ID}" ] && [ -n "${HF_TOKEN:-}" ] && [ "${ENTRYPOINT_DRY}" != "1" ]; then
-  mkdir -p "${STAGE}"
-  echo "[entrypoint] [HF] snapshot_download: ${HF_REPO_ID}@${HF_BRANCH}"
-  python3 - "$HF_REPO_ID" "$HF_BRANCH" "$STAGE" <<'PY'
-import os, sys
-from huggingface_hub import snapshot_download
-repo_id, branch, dst = sys.argv[1:]
-token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-if not token:
-    sys.exit(0)
-snapshot_download(repo_id=repo_id, revision=branch, local_dir=dst, local_dir_use_symlinks=False, token=token)
-print("[entrypoint] HF snapshot OK ->", dst)
-PY
+# Pfade
+MODELS="${WORKSPACE}/models"
+CKPTS="${WORKSPACE}/annotators/ckpts"
+CNODES="${WORKSPACE}/custom_nodes"
+WFS="${WORKSPACE}/workflows"
+UX="${WORKSPACE}/web_extensions/userstyle"
+AUX_DIR="${CNODES}/comfyui_controlnet_aux"
+AUX_MODELS="${AUX_DIR}/models"
 
-  # Helper rsync-Funktion
-  rs() {
-    SRC="$1"; DST="$2"
-    [ -d "$SRC" ] || return 0
-    mkdir -p "$DST"
+mkdir -p "${MODELS}/checkpoints" "${MODELS}/loras" "${MODELS}/controlnet" \
+         "${CKPTS}" "${CNODES}" "${WFS}" "${UX}" "${AUX_MODELS}"
+
+# Helper: rsync-Fallback
+safe_copy() {
+  SRC="$1"; DST="$2"
+  [ -d "$SRC" ] || return 0
+  mkdir -p "$DST"
+  if command -v rsync >/dev/null 2>&1; then
     if [ "${HF_DELETE_EXTRAS}" = "1" ]; then
       rsync -a --delete "${SRC}/" "${DST}/" || true
     else
       rsync -a          "${SRC}/" "${DST}/" || true
     fi
-  }
+  else
+    # Fallback ohne --delete
+    cp -a "${SRC}/." "${DST}/" || true
+  fi
+}
 
-  # Spiegeln nach WORKSPACE
-  rs "${STAGE}/custom_nodes"            "${WORKSPACE}/custom_nodes"
-  rs "${STAGE}/annotators/ckpts"        "${WORKSPACE}/annotators/ckpts"
-  rs "${STAGE}/models"                  "${WORKSPACE}/models"
-  rs "${STAGE}/workflows"               "${WORKSPACE}/workflows"
-  rs "${STAGE}/web_extensions/userstyle" "${WORKSPACE}/web_extensions/userstyle"
+# ---------- NSFW Bypass (CSS) ----------
+USERCSS="${UX}/user.css"
+if [ ! -f "${USERCSS}" ]; then
+  cat > "${USERCSS}" <<'CSS'
+/* remove/override any moderation blur & warnings */
+* [class*="moderation"], .moderation, .nsfw, .blur, .nsfw-blur { display: none !important; visibility: hidden !important; }
+img, canvas, video { filter: none !important; }
+CSS
+  say "[entrypoint] NSFW bypass CSS gesetzt."
 fi
 
-# ---------- controlnet_aux (OpenPose/DWPose) – EIN Master-Block ----------
-CN_DIR="${COMFYUI_BASE}/custom_nodes/comfyui_controlnet_aux"
+# ---------- HF Snapshot Download ----------
+STAGE="${WORKSPACE}/.hf_stage"
+if [ "${ENTRYPOINT_DRY}" = "1" ]; then
+  say "[entrypoint] DRY: HF-Sync übersprungen."
+else
+  if [ "${HF_SYNC}" = "1" ]; then
+    mkdir -p "${STAGE}"
+    python3 - "$@" <<'PY'
+import os, sys
+from huggingface_hub import snapshot_download
 
-# Bevorzugt Version aus HF-Bundle verlinken
-if [ ! -d "${CN_DIR}" ] && [ -d "${WORKSPACE}/custom_nodes/comfyui_controlnet_aux" ]; then
-  ln -s "${WORKSPACE}/custom_nodes/comfyui_controlnet_aux" "${CN_DIR}"
+repo_id = os.environ.get("HF_REPO_ID", "")
+revision = os.environ.get("HF_BRANCH", "main")
+local_dir = os.environ.get("STAGE", "/workspace/.hf_stage")
+token = os.environ.get("HF_TOKEN") or None
+
+print(f"[entrypoint] [HF] snapshot_download: {repo_id}@{revision}")
+try:
+    snapshot_download(
+        repo_id=repo_id,
+        revision=revision,
+        local_dir=local_dir,
+        local_dir_use_symlinks=False,
+        allow_patterns=None,  # alles
+        token=token,
+        repo_type="model",
+    )
+    print("[entrypoint] [HF] OK.")
+except Exception as e:
+    print("[entrypoint] [HF] WARN:", e)
+    sys.exit(0)
+PY
+    # Mirror ins WORKSPACE-Layout
+    safe_copy "${STAGE}/custom_nodes"             "${CNODES}"
+    safe_copy "${STAGE}/annotators/ckpts"         "${CKPTS}"
+    safe_copy "${STAGE}/models"                   "${MODELS}"
+    safe_copy "${STAGE}/workflows"                "${WFS}"
+    safe_copy "${STAGE}/web_extensions/userstyle" "${UX}"
+  else
+    say "[entrypoint] HF-Sync: skip."
+  fi
 fi
 
-# Sonst von GitHub klonen (öffentl.)
-if [ ! -d "${CN_DIR}" ]; then
-  echo "[entrypoint] clone comfyui_controlnet_aux (public)…"
-  git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux "${CN_DIR}" || true
+# ---------- controlnet_aux sicherstellen ----------
+if [ ! -d "${AUX_DIR}" ]; then
+  say "[entrypoint] Clone controlnet_aux …"
+  if command -v git >/dev/null 2>&1; then
+    git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux "${AUX_DIR}" || true
+  else
+    # ZIP-Fallback
+    TMP="/tmp/cnaux.zip"
+    wget -q -O "$TMP" https://codeload.github.com/Fannovel16/comfyui_controlnet_aux/zip/refs/heads/master || true
+    (cd "${CNODES}" && unzip -q "$TMP" && mv comfyui_controlnet_aux-* comfyui_controlnet_aux || true)
+    rm -f "$TMP"
+  fi
+else
+  # Optional update, ignoriert Fehler
+  (cd "${AUX_DIR}" && if [ -d .git ]; then git pull --ff-only || true; fi)
 fi
 
-# Abhängigkeiten installieren (tolerant)
-if [ -f "${CN_DIR}/requirements.txt" ]; then
-  pip3 install --no-cache-dir -r "${CN_DIR}/requirements.txt" -q || true
-fi
-pip3 install --no-cache-dir opencv-python onnx onnxruntime -q || true
-
-# Modelle bereitstellen
-AUX_MODELS="${CN_DIR}/models"
-mkdir -p "${AUX_MODELS}"
-
-# Wenn HF annotators/ckpts existiert → Dateien verlinken (keine Duplikate)
-CKPTS="${WORKSPACE}/annotators/ckpts"
-if [ -d "${CKPTS}" ]; then
-  for f in body_pose_model.pth hand_pose_model.pth facenet.pth yolox_l.onnx yolox_l.torchscript dw-ll_ucoco_384.pth dw-ll_ucoco_384.onnx; do
-    [ -f "${CKPTS}/${f}" ] && ln -sf "${CKPTS}/${f}" "${AUX_MODELS}/${f}"
-  done
+# ---------- controlnet_aux Dependencies ----------
+python3 -m pip install --no-warn-script-location -U opencv-python onnx onnxruntime >/dev/null 2>&1 || true
+REQ="${AUX_DIR}/requirements.txt"
+if [ -f "${REQ}" ]; then
+  python3 -m pip install --no-warn-script-location -r "${REQ}" >/dev/null 2>&1 || true
 fi
 
-# Fallback-Download fehlender Dateien (nett + optional)
-dl () { URL="$1"; OUT="$2"; [ -f "$OUT" ] && [ -s "$OUT" ] && return 0; echo "[entrypoint] dl $(basename "$OUT")"; curl -L --fail --retry 3 -o "$OUT" "$URL" || true; }
-if [ "${ENTRYPOINT_DRY}" != "1" ]; then
-  # OpenPose
-  dl "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/ckpts/body_pose_model.pth" "${AUX_MODELS}/body_pose_model.pth"
-  dl "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/ckpts/hand_pose_model.pth" "${AUX_MODELS}/hand_pose_model.pth"
-  # Optional – nicht mehr immer vorhanden, daher tolerant
-  dl "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/ckpts/facenet.pth"         "${AUX_MODELS}/facenet.pth"
-  # DWPose
-  dl "https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx"            "${AUX_MODELS}/yolox_l.onnx"
-  dl "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.pth"     "${AUX_MODELS}/dw-ll_ucoco_384.pth"
-fi
+# ---------- Modelle (OpenPose & DWPose) ----------
+dl() { URL="$1"; OUT="$2"; [ -s "${OUT}" ] && return 0; mkdir -p "$(dirname "${OUT}")"; say "[entrypoint] ↓ $(basename "${OUT}")"; curl -L --fail -o "${OUT}" "${URL}" >/dev/null 2>&1 || wget -q -O "${OUT}" "${URL}" || true; }
 
-# Legacy-Alias-Patch (einmalig)
-INIT_PY="${CN_DIR}/node_wrappers/__init__.py"
-if [ -f "${INIT_PY}" ] && ! grep -q "BEGIN comfy-runpod legacy alias patch" "${INIT_PY}" 2>/dev/null; then
-  cat >> "${INIT_PY}" <<'PY'
+# OpenPose
+dl "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/openpose/body_pose_model.pth" "${AUX_MODELS}/body_pose_model.pth"
+dl "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/openpose/hand_pose_model.pth" "${AUX_MODELS}/hand_pose_model.pth"
+dl "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/openpose/face_pose_model.pth" "${AUX_MODELS}/face_pose_model.pth"
+
+# DWPose (.onnx + .pth – beide Varianten abdecken)
+dl "https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx"              "${AUX_MODELS}/yolox_l.onnx"
+dl "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.onnx"      "${AUX_MODELS}/dw-ll_ucoco_384.onnx"
+dl "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.pth"       "${AUX_MODELS}/dw-ll_ucoco_384.pth"
+
+# Modelle zusätzlich in ComfyUI/models/controlnet-aux spiegeln
+MCN="${COMFYUI_BASE}/models/controlnet-aux"
+mkdir -p "${MCN}"
+for f in body_pose_model.pth hand_pose_model.pth face_pose_model.pth yolox_l.onnx dw-ll_ucoco_384.onnx dw-ll_ucoco_384.pth; do
+  [ -s "${AUX_MODELS}/${f}" ] && cp -n "${AUX_MODELS}/${f}" "${MCN}/${f}" || true
+done
+
+# ---------- Legacy-Aliase patchen ----------
+NW_INIT="${AUX_DIR}/node_wrappers/__init__.py"
+if [ -f "${NW_INIT}" ] && ! grep -q "BEGIN comfy-runpod legacy alias patch" "${NW_INIT}"; then
+  cat >> "${NW_INIT}" <<'PY'
 # --- BEGIN comfy-runpod legacy alias patch ---
 try:
     _m = NODE_CLASS_MAPPINGS
@@ -128,43 +172,58 @@ except Exception as _e:
     print("[controlnet_aux] alias patch warn:", _e)
 # --- END comfy-runpod legacy alias patch ---
 PY
+  say "[entrypoint] Alias-Patch gesetzt."
 fi
 
-# Workflow-Normalisierung (alte Klassennamen → neue)
-python3 - <<'PY'
-import os, re
-dirs = [
-    "/workspace/workflows",
-    "/content/workspace/workflows",
-    "/workspace/ComfyUI/workflows",
-    "/content/ComfyUI/workflows",
-]
-repls = {
+# ---------- Workflows normalisieren ----------
+python3 - "$@" <<'PY'
+import os, re, json, sys, glob
+candidates = []
+for base in (os.environ.get("WORKSPACE","/workspace"), os.environ.get("COMFYUI_BASE","/content/ComfyUI")):
+    wf = os.path.join(base, "workflows")
+    if os.path.isdir(wf):
+        for root, _, files in os.walk(wf):
+            for fn in files:
+                if fn.lower().endswith(".json"):
+                    candidates.append(os.path.join(root, fn))
+
+REPL = {
     r'"controlnet_aux\.OpenposePreprocessor"': '"controlnet_aux.OpenPosePreprocessor"',
-    r'"controlnet_aux\.DWposePreprocessor"':   '"controlnet_aux.DWPosePreprocessor"',
-    r'"controlnet_aux\.OpenposeDetector"':     '"controlnet_aux.OpenPoseDetector"',
-    r'"controlnet_aux\.DWposeDetector"':       '"controlnet_aux.DWPoseDetector"',
+    r'"controlnet_aux\.DWposePreprocessor"'  : '"controlnet_aux.DWPosePreprocessor"',
+    r'"controlnet_aux\.OpenposeDetector"'    : '"controlnet_aux.OpenPoseDetector"',
+    r'"controlnet_aux\.DWposeDetector"'      : '"controlnet_aux.DWPoseDetector"',
 }
-n=0
-for d in dirs:
-    if not os.path.isdir(d): continue
-    for root,_,files in os.walk(d):
-        for fn in files:
-            if fn.lower().endswith(".json"):
-                p = os.path.join(root, fn)
-                try:
-                    s = open(p,"r",encoding="utf-8").read()
-                    s2 = s
-                    for k,v in repls.items():
-                        s2 = re.sub(k, v, s2)
-                    if s2 != s:
-                        open(p,"w",encoding="utf-8").write(s2); n+=1
-                except Exception:
-                    pass
-print("[entrypoint] workflow normalize:", n)
+fixed = 0
+for p in candidates:
+    try:
+        s = open(p, "r", encoding="utf-8").read()
+        s2 = s
+        for pat, rep in REPL.items():
+            s2 = re.sub(pat, rep, s2)
+        if s2 != s:
+            open(p, "w", encoding="utf-8").write(s2)
+            fixed += 1
+    except Exception as e:
+        print("[entrypoint] workflow patch warn:", p, e)
+print(f"[entrypoint] workflow normalized: {fixed}")
 PY
 
+# ---------- Dry-Run Ende ----------
+if [ "${ENTRYPOINT_DRY}" = "1" ]; then
+  say "[entrypoint] DRY: Ende (keine Server gestartet)."
+  exit 0
+fi
+
 # ---------- ComfyUI starten ----------
+export PYTHONPATH="${COMFYUI_BASE}/custom_nodes:${PYTHONPATH:-}"
 cd "${COMFYUI_BASE}"
-export PYTHONPATH="${COMFYUI_BASE}:${COMFYUI_BASE}/custom_nodes:${PYTHONPATH:-}"
-exec python3 main.py --listen 0.0.0.0 --port "${COMFYUI_PORT}" --enable-cors-header "*"
+say "[entrypoint] Starte ComfyUI auf :${COMFYUI_PORT}"
+python3 main.py --listen 0.0.0.0 --port "${COMFYUI_PORT}" >/workspace/comfyui.log 2>&1 &
+
+# Optional: Jupyter
+if [ "${ENABLE_JUPYTER}" = "1" ]; then
+  say "[entrypoint] Starte Jupyter auf :${JUPYTER_PORT}"
+  jupyter lab --ip=0.0.0.0 --port="${JUPYTER_PORT}" --NotebookApp.token='' --NotebookApp.password='' >/workspace/jupyter.log 2>&1 &
+fi
+
+wait
